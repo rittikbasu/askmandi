@@ -23,8 +23,16 @@ ${COMMODITIES}
 Rules:
 - Always filter by latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
 - Case-insensitive commodity search: commodity ILIKE '%tomato%'
-- LIMIT 10 for lists
-- Use modal_price for price comparisons
+- Use modal_price for price comparisons (cast to numeric for math/order): modal_price::numeric
+- Avoid misleading sampling for comparisons:
+  - If the user asks to compare across states/districts/markets, prefer an AGGREGATED result (e.g. one row per state) instead of returning raw rows.
+  - Example (compare across states): SELECT state, COUNT(*) AS rows, COUNT(DISTINCT market) AS markets, MIN(modal_price::numeric) AS min_modal, MAX(modal_price::numeric) AS max_modal, AVG(modal_price::numeric) AS avg_modal FROM mandi_prices WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices) AND commodity ILIKE '%potato%' AND state IN ('Tamil Nadu','Kerala') GROUP BY state ORDER BY state;
+- For "top/cheapest/highest" style questions, return raw rows but keep it bounded:
+  - Prefer SELECT DISTINCT (to avoid duplicates)
+  - Use ORDER BY with modal_price::numeric
+  - Use LIMIT between 10 and 200 depending on how many items the user asked for (never more than 200)
+- NEVER use SELECT *
+- If the user asks for "all data", "everything", or an unbounded dump, respond UNCLEAR
 
 IMPORTANT: If the question is:
 - Gibberish, nonsensical, or unrelated to mandi/commodity prices
@@ -87,6 +95,36 @@ function extractSqlFromResponse(text) {
   return sql || null;
 }
 
+function sanitizeSql(sql) {
+  if (!sql) return sql;
+
+  const trimmed = sql.trim();
+  const hasGroupBy = /\bGROUP\s+BY\b/i.test(trimmed);
+  const hasAggregate =
+    /\b(COUNT|AVG|MIN|MAX|SUM|PERCENTILE_CONT|PERCENTILE_DISC)\s*\(/i.test(
+      trimmed
+    );
+  const limitMatch = trimmed.match(/\bLIMIT\s+(\d+)\b/i);
+
+  // If the query returns raw rows without any aggregation, enforce a reasonable bound.
+  if (!limitMatch && !hasGroupBy && !hasAggregate) {
+    return trimmed.replace(/;?\s*$/, "\nLIMIT 200;");
+  }
+
+  // If present, clamp extreme limits.
+  if (limitMatch) {
+    const n = Number(limitMatch[1]);
+    if (Number.isFinite(n) && n > 500) {
+      return trimmed.replace(/\bLIMIT\s+\d+\b/i, "LIMIT 500");
+    }
+    if (Number.isFinite(n) && n <= 0) {
+      return trimmed.replace(/\bLIMIT\s+\d+\b/i, "LIMIT 200");
+    }
+  }
+
+  return trimmed;
+}
+
 function extractJsonFromMcpResult(result) {
   try {
     const rawText = result?.content?.[0]?.text || "";
@@ -120,14 +158,18 @@ export async function POST(req) {
     if (!projectRef) {
       throw new Error("SUPABASE_PROJECT_REF is not configured");
     }
+    const pat = process.env.SUPABASE_PAT;
+    if (!pat) {
+      throw new Error("SUPABASE_PAT is not configured");
+    }
 
-    // Phase 1: Generate SQL query (use gpt-4.1-mini - fast, no reasoning overhead)
+    // Phase 1: Generate SQL query
     const sqlResult = await generateText({
       model: openai("gpt-5.1"),
       system: SQL_PROMPT,
       prompt: lastUserMessage,
       maxTokens: 200,
-      reasoningEffort: "minimal",
+      reasoningEffort: "low",
     });
 
     const rawResponse = (sqlResult.text || "").trim();
@@ -159,13 +201,14 @@ export async function POST(req) {
     if (!sqlQuery) {
       throw new Error("Failed to generate SQL query");
     }
+    const safeSqlQuery = sanitizeSql(sqlQuery);
 
     // Phase 2: Execute SQL via MCP
     mcpClient = await createMCPClient({
       transport: {
         type: "http",
         url: `https://mcp.supabase.com/mcp?project_ref=${projectRef}`,
-        headers: { Authorization: `Bearer ${process.env.SUPABASE_PAT}` },
+        headers: { Authorization: `Bearer ${pat}` },
       },
     });
 
@@ -174,7 +217,7 @@ export async function POST(req) {
       throw new Error("MCP did not expose the execute_sql tool");
     }
 
-    const sqlData = await mcpTools.execute_sql.execute({ query: sqlQuery });
+    const sqlData = await mcpTools.execute_sql.execute({ query: safeSqlQuery });
     const data = extractJsonFromMcpResult(sqlData);
 
     // Close MCP client early
@@ -206,7 +249,7 @@ export async function POST(req) {
     );
 
     // Phase 3: Stream the summary
-    const summaryResult = await streamText({
+    const summaryResult = streamText({
       model: openai("gpt-4.1-nano"),
       system: SUMMARY_PROMPT,
       prompt: `Question: ${lastUserMessage}\n\nData:\n${toonData}\n\nProvide a helpful, concise answer.`,
