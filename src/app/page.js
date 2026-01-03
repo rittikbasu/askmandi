@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import Image from "next/image";
 import { ArrowUp, Check, Copy } from "lucide-react";
 import MarkdownMessage from "../components/MarkdownMessage";
@@ -8,7 +8,7 @@ import mandiLogo from "@public/favicon.png";
 
 const PROMPT_SUGGESTIONS = [
   "Where are tomatoes the cheapest today?",
-  "Compare potato prices across Maharashtra and Kerala",
+  "Compare potato prices across Tamil Nadu and Kerala",
   "What's the average price of onions in Gujarat?",
   "Which market has the highest wheat prices?",
 ];
@@ -29,14 +29,27 @@ export default function Home() {
   const [isMultiline, setIsMultiline] = useState(false);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
+  const streamDraftRef = useRef("");
+  const streamFlushTimerRef = useRef(null);
+  const lastScrollAtRef = useRef(0);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  const scrollToBottom = useCallback((behavior = "auto") => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  }, []);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, streamingContent]);
+    // Smooth scroll only when a full message is appended; streaming updates are throttled.
+    if (!streamingContent) {
+      scrollToBottom("smooth");
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastScrollAtRef.current > 120) {
+      lastScrollAtRef.current = now;
+      scrollToBottom("auto");
+    }
+  }, [messages, streamingContent, scrollToBottom]);
 
   const syncTextarea = () => {
     const el = textareaRef.current;
@@ -91,6 +104,11 @@ export default function Home() {
     setIsLoading(true);
     setIsMultiline(false);
     setStreamingContent("");
+    streamDraftRef.current = "";
+    if (streamFlushTimerRef.current) {
+      clearTimeout(streamFlushTimerRef.current);
+      streamFlushTimerRef.current = null;
+    }
 
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
@@ -110,6 +128,16 @@ export default function Home() {
       const contentType = response.headers.get("content-type") || "";
 
       if (contentType.includes("text/event-stream")) {
+        if (!response.ok) {
+          // Best-effort parse of JSON error body for non-2xx responses.
+          let errMsg = `Request failed (${response.status})`;
+          try {
+            const data = await response.json();
+            errMsg = data?.error || data?.details || errMsg;
+          } catch {}
+          throw new Error(errMsg);
+        }
+
         const reader = response.body?.getReader();
         if (!reader) {
           throw new Error("Streaming not supported in this browser");
@@ -121,7 +149,13 @@ export default function Home() {
 
         const handleEvent = (eventType, payload) => {
           if (eventType === "delta" && payload?.delta) {
-            setStreamingContent((prev) => prev + payload.delta);
+            streamDraftRef.current += payload.delta;
+            if (!streamFlushTimerRef.current) {
+              streamFlushTimerRef.current = setTimeout(() => {
+                setStreamingContent(streamDraftRef.current);
+                streamFlushTimerRef.current = null;
+              }, 50);
+            }
           } else if (eventType === "done") {
             const finalText = payload?.fullText || "";
             const usage = payload?.usage || null;
@@ -133,6 +167,7 @@ export default function Home() {
                 usage,
               },
             ]);
+            streamDraftRef.current = "";
             setStreamingContent("");
           } else if (eventType === "error") {
             streamError = new Error(payload?.message || "Stream error");
@@ -178,8 +213,13 @@ export default function Home() {
           usage: null,
         },
       ]);
+      streamDraftRef.current = "";
       setStreamingContent("");
     } finally {
+      if (streamFlushTimerRef.current) {
+        clearTimeout(streamFlushTimerRef.current);
+        streamFlushTimerRef.current = null;
+      }
       setIsLoading(false);
     }
   };
@@ -283,7 +323,6 @@ export default function Home() {
               }}
               onKeyDown={handleKeyDown}
               placeholder="Ask anything about mandi prices..."
-              disabled={isLoading}
               rows={1}
               maxLength={200}
               className="w-full resize-none bg-zinc-900/80 border border-zinc-700/50 rounded-2xl backdrop-blur-sm px-4 py-3 pr-12 text-sm leading-relaxed placeholder:text-zinc-500 focus:border-lime-500/50 focus:outline-none focus:ring-1 focus:ring-lime-500/50 disabled:opacity-50 min-h-[48px] max-h-48"
