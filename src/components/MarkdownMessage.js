@@ -202,6 +202,37 @@ export default function MarkdownMessage({ content, variant = "assistant" }) {
         continue;
       }
 
+      // Table detection
+      if (line.includes("|") && line.trim().startsWith("|")) {
+        const tableLines = [];
+        while (i < lines.length && lines[i].includes("|")) {
+          tableLines.push(lines[i]);
+          i += 1;
+        }
+        if (tableLines.length >= 2) {
+          // Parse header
+          const headerLine = tableLines[0];
+          const headers = headerLine
+            .split("|")
+            .map((h) => h.trim())
+            .filter(Boolean);
+
+          // Skip separator line (|---|---|)
+          const dataStartIdx = tableLines[1].includes("---") ? 2 : 1;
+
+          // Parse rows
+          const rows = tableLines.slice(dataStartIdx).map((rowLine) =>
+            rowLine
+              .split("|")
+              .map((c) => c.trim())
+              .filter((_, idx, arr) => idx > 0 && idx < arr.length)
+          );
+
+          parsed.push({ type: "table", headers, rows });
+          continue;
+        }
+      }
+
       if (!line.trim()) {
         i += 1;
         continue;
@@ -289,6 +320,48 @@ export default function MarkdownMessage({ content, variant = "assistant" }) {
 
         if (block.type === "hr") {
           return <hr key={`hr_${idx}`} className={hrClass} />;
+        }
+
+        if (block.type === "table") {
+          const tableClass = isUser
+            ? "w-full text-sm border-collapse"
+            : "w-full text-sm border-collapse";
+          const thClass = isUser
+            ? "text-left px-2 py-1.5 border-b border-zinc-300 font-medium text-black bg-zinc-100"
+            : "text-left px-2 py-1.5 border-b border-zinc-700 font-medium text-zinc-100 bg-zinc-800/50";
+          const tdClass = isUser
+            ? "px-2 py-1.5 border-b border-zinc-200 text-black"
+            : "px-2 py-1.5 border-b border-zinc-800 text-zinc-200";
+
+          return (
+            <div key={`table_${idx}`} className="overflow-x-auto -mx-1">
+              <table className={tableClass}>
+                <thead>
+                  <tr>
+                    {block.headers.map((header, hIdx) => (
+                      <th key={`th_${idx}_${hIdx}`} className={thClass}>
+                        {renderInlineMarkdown(header, inlineStyles)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rIdx) => (
+                    <tr key={`tr_${idx}_${rIdx}`}>
+                      {row.map((cell, cIdx) => (
+                        <td
+                          key={`td_${idx}_${rIdx}_${cIdx}`}
+                          className={tdClass}
+                        >
+                          {renderInlineMarkdown(cell, inlineStyles)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
         }
 
         const lines = block.text.split("\n");
