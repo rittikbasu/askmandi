@@ -9,6 +9,10 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@ai-sdk/mcp": "^1.0.2",
+    "@ai-sdk/openai": "^3.0.2",
+    "ai": "^6.0.6",
+    "lucide-react": "^0.562.0",
     "next": "16.1.1",
     "react": "19.2.3",
     "react-dom": "19.2.3"
