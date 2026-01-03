@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 export const metadata = {
   title: "Ask Mandi",
   description:
-    "Get instant answers about commodity prices from 550+ agricultural markets across India. Compare rates, find the cheapest markets, and track price trends — all in plain language.",
+    "Get instant answers about commodity prices from 900+ agricultural markets across India. Compare rates, find the cheapest markets, and track price trends all in plain language.",
   icons: {
     icon: "/favicon.png",
   },
