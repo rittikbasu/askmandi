@@ -3,6 +3,8 @@
 :root {
   --background: #000000;
   --foreground: #ffffff;
+  --scrollbar-thumb: rgba(113, 113, 122, 0.55);
+  --scrollbar-thumb-hover: rgba(161, 161, 170, 0.7);
 }
 
 @theme inline {
@@ -15,7 +17,6 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
 }
 
 /* Custom scrollbar */
@@ -28,12 +29,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
+  background: var(--scrollbar-thumb);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--zinc-500);
+  background: var(--scrollbar-thumb-hover);
 }
 
 /* Auto-resize textarea */
