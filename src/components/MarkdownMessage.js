@@ -225,7 +225,8 @@ export default function MarkdownMessage({ content, variant = "assistant" }) {
             rowLine
               .split("|")
               .map((c) => c.trim())
-              .filter((_, idx, arr) => idx > 0 && idx < arr.length)
+              // exclude the leading "" and trailing "" caused by pipes at ends
+              .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1)
           );
 
           parsed.push({ type: "table", headers, rows });
@@ -323,43 +324,93 @@ export default function MarkdownMessage({ content, variant = "assistant" }) {
         }
 
         if (block.type === "table") {
-          const tableClass = isUser
-            ? "w-full text-sm border-collapse"
-            : "w-full text-sm border-collapse";
+          const tableClass =
+            "w-full min-w-max text-sm border-separate border-spacing-0";
+
+          // Rounded frame + clip (so header corners and row hovers don’t bleed)
+          const shellClass = isUser
+            ? "overflow-hidden rounded-xl border border-zinc-200 bg-white"
+            : "overflow-hidden rounded-xl border border-zinc-700/50 bg-zinc-950/30";
+
+          // Put background on the TH cells (not thead) so it always paints correctly
+          const thBase =
+            "text-center px-3 py-2 font-medium whitespace-nowrap border-b border-r last:border-r-0";
           const thClass = isUser
-            ? "text-left px-2 py-1.5 border-b border-zinc-300 font-medium text-black bg-zinc-100"
-            : "text-left px-2 py-1.5 border-b border-zinc-700 font-medium text-zinc-100 bg-zinc-800/50";
+            ? `${thBase} border-zinc-200 text-black bg-zinc-100`
+            : `${thBase} border-zinc-700 text-zinc-100 bg-zinc-900/60`;
+
+          const tdBase =
+            "px-3 py-2 text-center border-b border-r last:border-r-0";
           const tdClass = isUser
-            ? "px-2 py-1.5 border-b border-zinc-200 text-black"
-            : "px-2 py-1.5 border-b border-zinc-800 text-zinc-200";
+            ? `${tdBase} border-zinc-200 text-black`
+            : `${tdBase} border-zinc-800 text-zinc-200`;
 
           return (
-            <div key={`table_${idx}`} className="overflow-x-auto -mx-1">
-              <table className={tableClass}>
-                <thead>
-                  <tr>
-                    {block.headers.map((header, hIdx) => (
-                      <th key={`th_${idx}_${hIdx}`} className={thClass}>
-                        {renderInlineMarkdown(header, inlineStyles)}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {block.rows.map((row, rIdx) => (
-                    <tr key={`tr_${idx}_${rIdx}`}>
-                      {row.map((cell, cIdx) => (
-                        <td
-                          key={`td_${idx}_${rIdx}_${cIdx}`}
-                          className={tdClass}
-                        >
-                          {renderInlineMarkdown(cell, inlineStyles)}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div key={`table_${idx}`} className="-mx-1">
+              <div className={shellClass}>
+                {/* Scroll INSIDE the rounded/bordered shell */}
+                <div
+                  className="
+                      overflow-x-auto
+                      [-webkit-overflow-scrolling:touch]
+                      touch-pan-x
+                      [scrollbar-width:thin]
+                      [&::-webkit-scrollbar]:h-2
+                      [&::-webkit-scrollbar-thumb]:rounded-full
+                      [&::-webkit-scrollbar-thumb]:bg-zinc-700/60
+                      hover:[&::-webkit-scrollbar-thumb]:bg-zinc-600/70
+                      [&::-webkit-scrollbar-track]:bg-transparent
+                    "
+                >
+                  <table className={tableClass}>
+                    <thead>
+                      <tr>
+                        {block.headers.map((header, hIdx) => (
+                          <th
+                            key={`th_${idx}_${hIdx}`}
+                            className={[thClass].join(" ")}
+                          >
+                            {renderInlineMarkdown(header, inlineStyles)}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+
+                    <tbody>
+                      {block.rows.map((row, rIdx) => {
+                        const isLastRow = rIdx === block.rows.length - 1;
+
+                        return (
+                          <tr
+                            key={`tr_${idx}_${rIdx}`}
+                            className={
+                              isUser
+                                ? "odd:bg-black/2 hover:bg-black/4"
+                                : "odd:bg-white/2 hover:bg-white/4"
+                            }
+                          >
+                            {row.map((cell, cIdx) => {
+                              const isLastCol = cIdx === row.length - 1;
+
+                              return (
+                                <td
+                                  key={`td_${idx}_${rIdx}_${cIdx}`}
+                                  className={[
+                                    tdClass,
+                                    isLastRow ? "border-b-0" : "",
+                                  ].join(" ")}
+                                >
+                                  {renderInlineMarkdown(cell, inlineStyles)}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           );
         }
