@@ -7,7 +7,7 @@ import MarkdownMessage from "../components/MarkdownMessage";
 import mandiLogo from "@public/favicon.png";
 
 const PROMPT_SUGGESTIONS = [
-  "Where are tomatoes the cheapest today?",
+  "Where are apples the cheapest today?",
   "Compare potato prices across Tamil Nadu and Kerala",
   "What's the average price of onions in Gujarat?",
   "Which market has the highest wheat prices?",
@@ -16,9 +16,42 @@ const PROMPT_SUGGESTIONS = [
 const WELCOME_MESSAGE = {
   role: "assistant",
   isIntro: true,
-  content: `**Ask Mandi** gives you instant access to live commodity prices from 900+ agricultural markets across India.
+  content: `**Ask Mandi** uses open data by the Govt of India to give you access to commodity prices like tomatoes, onions, potatoes & more from 900+ agricultural markets across India.
 
 Whether you're a farmer checking today's rates, a trader comparing prices across states, or just curious about market trends ask in plain language and get answers in seconds.`,
+};
+
+const toPlainText = (input) => {
+  const src = String(input ?? "");
+  return src
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/```/g, ""))
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/^>\s?/gm, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/!\[([^\]]*)\]\((.*?)\)/g, "$1 ($2)")
+    .replace(/\[([^\]]+)\]\((.*?)\)/g, "$1 ($2)")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+};
+
+const writeClipboard = async (text) => {
+  if (!text) return false;
+  if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+    return false;
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (err) {
+    console.error("Failed to copy text", err);
+    return false;
+  }
 };
 
 export default function Home() {
@@ -56,11 +89,11 @@ export default function Home() {
     if (!el) return;
 
     el.style.height = "auto";
-    const maxHeight = 150;
+    const maxHeight = 192;
     const nextHeight = Math.min(el.scrollHeight, maxHeight);
     el.style.height = `${nextHeight}px`;
 
-    setIsMultiline(el.scrollHeight > 52);
+    setIsMultiline(el.scrollHeight > 48);
   };
 
   const parseSseBuffer = (buffer, handlers) => {
@@ -357,6 +390,15 @@ function Message({ message, isWelcome = false, onSuggestionClick }) {
       ? message.usage.totalTokens
       : null;
 
+  const handleCopy = useCallback(async () => {
+    const plainText = toPlainText(message.content);
+    const success = await writeClipboard(plainText);
+    if (success) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    }
+  }, [message.content]);
+
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div className="max-w-[92%] md:max-w-[70%]">
@@ -400,53 +442,7 @@ function Message({ message, isWelcome = false, onSuggestionClick }) {
           <div className="flex items-center gap-2 mt-2">
             <button
               type="button"
-              onClick={() => {
-                const text = message.content || "";
-
-                // iOS-compatible copy with fallback
-                const copyToClipboard = async () => {
-                  // Try modern API first
-                  if (navigator.clipboard?.writeText) {
-                    try {
-                      await navigator.clipboard.writeText(text);
-                      return true;
-                    } catch {}
-                  }
-
-                  // Fallback for iOS and older browsers
-                  const textarea = document.createElement("textarea");
-                  textarea.value = text;
-                  textarea.style.position = "fixed";
-                  textarea.style.left = "-9999px";
-                  textarea.style.top = "0";
-                  textarea.setAttribute("readonly", "");
-                  document.body.appendChild(textarea);
-
-                  // iOS requires selection range
-                  const range = document.createRange();
-                  range.selectNodeContents(textarea);
-                  const selection = window.getSelection();
-                  selection.removeAllRanges();
-                  selection.addRange(range);
-                  textarea.setSelectionRange(0, text.length);
-
-                  try {
-                    document.execCommand("copy");
-                    return true;
-                  } catch {
-                    return false;
-                  } finally {
-                    document.body.removeChild(textarea);
-                  }
-                };
-
-                copyToClipboard().then((success) => {
-                  if (success) {
-                    setCopied(true);
-                    setTimeout(() => setCopied(false), 1200);
-                  }
-                });
-              }}
+              onClick={handleCopy}
               className="inline-flex items-center gap-2 rounded-full border border-zinc-700/50 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400 hover:text-foreground"
               aria-label="Copy message"
             >
