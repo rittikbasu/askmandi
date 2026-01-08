@@ -348,7 +348,6 @@ export default function MarkdownMessage({ content, variant = "assistant" }) {
           return (
             <div key={`table_${idx}`} className="-mx-1">
               <div className={shellClass}>
-                {/* Scroll INSIDE the rounded/bordered shell */}
                 <div
                   className="
                       overflow-x-auto
