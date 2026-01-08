@@ -2,8 +2,10 @@ import { experimental_createMCPClient as createMCPClient } from "@ai-sdk/mcp";
 import { generateText, streamText } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { encode as toToon } from "@toon-format/toon";
+import { Redis } from "@upstash/redis";
+import { Ratelimit } from "@upstash/ratelimit";
 
-// All commodity names in the database (Title Case) - helps LLM map colloquial names to official ones
+// All commodity names in the db, helps LLM map colloquial names to official ones
 const COMMODITIES = `Vegetables: Amaranthus, Ashgourd, Beans, Beetroot, Bhindi(Ladies Finger), Bitter Gourd, Bottle Gourd, Brinjal, Bunch Beans, Cabbage, Capsicum, Carrot, Cauliflower, Chow Chow, Cluster Beans, Colacasia, Coriander(Leaves), Cowpea(Veg), Cucumbar(Kheera), Drumstick, Elephant Yam(Suran), French Beans(Frasbean), Garlic, Ginger(Green), Green Chilli, Green Peas, Knool Khol, Ladies Finger, Leafy Vegetable, Lemon, Lime, Little Gourd(Kundru), Long Melon(Kakri), Methi(Leaves), Mint(Pudina), Mushrooms, Onion, Onion Green, Peas Cod, Peas Wet, Pointed Gourd(Parval), Potato, Pumpkin, Raddish, Ridgeguard(Tori), Round Gourd, Season Leaves, Snake Gourd, Spinach, Sponge Gourd, Squash, Sweet Potato, Taro Leaves, Tinda, Tomato, Turnip, Yam(Ratalu)
 Fruits: Amla, Apple, Banana, Banana - Green, Ber, Chikoos(Sapota), Custard Apple, Grapes, Guava, Jack Fruit, Karbuja(Musk Melon), Kinnow, Kiwi, Mango, Mango(Raw-Ripe), Mousambi(Sweet Lime), Orange, Papaya, Papaya(Raw), Pear, Pineapple, Plum, Pomegranate, Tamarind Fruit, Water Melon
 Grains & Pulses: Arhar Dal, Arhar(Tur/Red Gram), Bajra(Pearl Millet), Barley(Jau), Bengal Gram Dal, Bengal Gram(Whole), Black Gram Dal, Black Gram(Urd), Foxtail Millet, Green Gram Dal, Green Gram(Moong), Jowar(Sorghum), Kabuli Chana, Kulthi(Horse Gram), Lentil(Masur), Maize, Paddy(Basmati), Paddy(Common), Ragi(Finger Millet), Red Gram, Rice, Wheat, White Peas
@@ -13,6 +15,57 @@ Cash Crops: Arecanut(Supari), Betel Leaves, Coffee, Cotton, Gur(Jaggery), Jagger
 
 const log = (...args) => console.log("[api/chat]", ...args);
 const encoder = new TextEncoder();
+
+const UPSTASH_URL = process.env.KV_REST_API_URL;
+const UPSTASH_TOKEN = process.env.KV_REST_API_TOKEN;
+
+const redis =
+  UPSTASH_URL && UPSTASH_TOKEN
+    ? new Redis({ url: UPSTASH_URL, token: UPSTASH_TOKEN })
+    : null;
+
+const ratelimit = redis
+  ? new Ratelimit({
+      redis,
+      limiter: Ratelimit.slidingWindow(10, "24h"),
+      prefix: "askmandi:rl",
+    })
+  : null;
+
+function normalizeCacheKey(input) {
+  return String(input || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'")
+    .replace(/[?!.]+$/g, "");
+}
+
+function getNextRefreshTTLSeconds() {
+  // TTL until next 3:30pm IST (data refresh time)
+  const now = new Date();
+  const istNow = new Date(
+    now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
+  );
+  const target = new Date(istNow);
+  target.setHours(15, 30, 0, 0);
+  if (istNow >= target) target.setDate(target.getDate() + 1);
+  return Math.max(60, Math.floor((target.getTime() - istNow.getTime()) / 1000));
+}
+
+function getVisitorKey(req) {
+  // Best-effort visitor key without auth.
+  const h = req.headers;
+  const xff = h.get("x-forwarded-for");
+  const ip =
+    (xff ? xff.split(",")[0].trim() : null) ||
+    h.get("x-real-ip") ||
+    h.get("cf-connecting-ip") ||
+    null;
+  const ua = h.get("user-agent") || "unknown";
+  return `ip:${ip || "unknown"}|ua:${ua.slice(0, 80)}`;
+}
 
 // Pricing per 1M tokens (in USD)
 const PRICING = {
@@ -129,10 +182,6 @@ Write a short, friendly response that:
 - Provides 2-3 specific example questions about mandi prices.
 
 Keep it under 3 short paragraphs.`;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function sanitize(value) {
   return String(value || "")
@@ -252,9 +301,7 @@ function rowContainsPlace(row, place) {
   return fields.some((f) => tokens.every((t) => match(f, t)));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // DB cache (states/districts)
-// ─────────────────────────────────────────────────────────────────────────────
 
 let statesCache = null;
 let statesCacheAt = 0;
@@ -384,6 +431,56 @@ export async function POST(req) {
     [...messages].reverse().find((m) => m?.role === "user")?.content || "";
   log("Incoming request", { lastUser: lastUserMessage });
 
+  if (!redis || !ratelimit) {
+    return Response.json(
+      {
+        error: "Server misconfigured",
+        details: "Set UPSTASH_REST_URL and UPSTASH_REST_TOKEN.",
+      },
+      { status: 500 }
+    );
+  }
+
+  // Check cache FIRST (cached responses are free - no rate limit consumed)
+  const normalizedMessage = normalizeCacheKey(lastUserMessage);
+  const cacheKey = `askmandi:cache:v1:${normalizedMessage}`;
+
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached && typeof cached === "object" && cached.message) {
+      log("Cache hit (free)", { key: cacheKey });
+      return Response.json({
+        message: cached.message,
+        usage: cached.usage || null,
+        cached: true,
+      });
+    }
+  } catch (e) {
+    log("Cache read failed", { message: e?.message });
+  }
+
+  // Rate limit only for non-cached (LLM) requests
+  const visitorKey = getVisitorKey(req);
+  const rl = await ratelimit.limit(visitorKey);
+
+  if (!rl.success) {
+    const retryAfterSeconds = rl.reset
+      ? Math.max(1, Math.ceil((Number(rl.reset) - Date.now()) / 1000))
+      : 3600;
+    return Response.json(
+      {
+        error:
+          "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow.",
+        remaining: 0,
+        reset: rl.reset,
+      },
+      { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } }
+    );
+  }
+
+  // Pass remaining quota in all responses so frontend can track
+  const remaining = rl.remaining;
+
   const requestedPlace = extractLocationHint(lastUserMessage);
   let mcpClient = null;
 
@@ -418,9 +515,8 @@ export async function POST(req) {
     let nanoTokens = { input: 0, output: 0 };
     let gpt5Tokens = { input: 0, output: 0 };
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Phase 1: Resolve location BEFORE generating SQL
-    // ─────────────────────────────────────────────────────────────────────────
+
     let locationContext = null;
     if (requestedPlace) {
       locationContext = await resolveLocation(
@@ -439,9 +535,8 @@ export async function POST(req) {
       });
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Phase 2: Generate SQL with location context
-    // ─────────────────────────────────────────────────────────────────────────
+
     const sqlPrompt = buildSqlPrompt(locationContext);
     const sqlResult = await generateText({
       model: openai("gpt-5.1"),
@@ -480,6 +575,7 @@ export async function POST(req) {
           clarification.text ||
           "I couldn't understand. Try asking about mandi prices.",
         usage: totalUsage,
+        remaining,
       });
     }
 
@@ -488,9 +584,8 @@ export async function POST(req) {
       throw new Error("Failed to generate safe SQL query");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Phase 3: Execute SQL (single query, no reruns!)
-    // ─────────────────────────────────────────────────────────────────────────
+
     let data = await runQuery(sql);
     log("SQL returned", data.length, "rows");
 
@@ -533,12 +628,12 @@ LIMIT 50;`;
           ? `No results found for **${requestedPlace}** on the latest date. Try a nearby district or the whole state.`
           : "No results found. Try checking the commodity name or broadening your search.",
         usage: totalUsage,
+        remaining,
       });
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Phase 4: Stream summary
-    // ─────────────────────────────────────────────────────────────────────────
+
     const toonData = toToon(data);
     log(
       "TOON:",
@@ -619,11 +714,27 @@ Provide a helpful, concise answer.`,
             total: `$${cost.totalCost.toFixed(6)}`,
           });
 
+          // Cache response until next 3:30pm IST (data refresh time)
+          if (cacheKey && redis) {
+            try {
+              const ttl = getNextRefreshTTLSeconds();
+              await redis.set(
+                cacheKey,
+                { message: fullText, usage: finalUsage },
+                { ex: ttl }
+              );
+              log("Cache set", { key: cacheKey, ttlSeconds: ttl });
+            } catch (e) {
+              log("Cache write failed", { message: e?.message });
+            }
+          }
+
           controller.enqueue(
             encoder.encode(
               `event: done\ndata:${JSON.stringify({
                 fullText,
                 usage: finalUsage,
+                remaining,
               })}\n\n`
             )
           );

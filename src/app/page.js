@@ -54,6 +54,26 @@ const writeClipboard = async (text) => {
   }
 };
 
+// localStorage quota tracking (avoids unnecessary API calls when limit reached)
+const QUOTA_KEY = "askmandi:remaining";
+
+const getStoredQuota = () => {
+  if (typeof window === "undefined") return null;
+  try {
+    const val = localStorage.getItem(QUOTA_KEY);
+    return val !== null ? parseInt(val, 10) : null;
+  } catch {
+    return null;
+  }
+};
+
+const setStoredQuota = (remaining) => {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(QUOTA_KEY, String(remaining));
+  } catch {}
+};
+
 export default function Home() {
   const [messages, setMessages] = useState([WELCOME_MESSAGE]);
   const [input, setInput] = useState("");
@@ -130,6 +150,23 @@ export default function Home() {
   const sendMessage = async (content) => {
     if (!content.trim() || isLoading) return;
 
+    // Check localStorage quota first (skip API call if definitely out of quota)
+    const storedQuota = getStoredQuota();
+    if (storedQuota === 0) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: content.trim() },
+        {
+          role: "assistant",
+          content:
+            "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow.",
+          usage: null,
+        },
+      ]);
+      setInput("");
+      return;
+    }
+
     const userMessage = { role: "user", content: content.trim() };
     const newMessages = [...messages, userMessage];
     setMessages(newMessages);
@@ -192,6 +229,10 @@ export default function Home() {
           } else if (eventType === "done") {
             const finalText = payload?.fullText || "";
             const usage = payload?.usage || null;
+            // Update localStorage with remaining quota from backend
+            if (typeof payload?.remaining === "number") {
+              setStoredQuota(payload.remaining);
+            }
             setMessages((prev) => [
               ...prev,
               {
@@ -226,7 +267,15 @@ export default function Home() {
       } else {
         const data = await response.json();
         if (!response.ok) {
+          // Update localStorage on rate limit error
+          if (response.status === 429) {
+            setStoredQuota(0);
+          }
           throw new Error(data.error || "Failed to get response");
+        }
+        // Update localStorage with remaining quota (skip for cached responses)
+        if (typeof data.remaining === "number" && !data.cached) {
+          setStoredQuota(data.remaining);
         }
         setMessages((prev) => [
           ...prev,
