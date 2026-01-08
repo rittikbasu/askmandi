@@ -3,15 +3,76 @@ import { generateText, streamText } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { encode as toToon } from "@toon-format/toon";
 
-// All commodity names in the database - helps LLM map colloquial names to official ones
-const COMMODITIES = `Vegetables: amaranthus, ashgourd, beans, beetroot, bhindi(ladies finger), bitter gourd, bottle gourd, brinjal, bunch beans, cabbage, capsicum, carrot, cauliflower, chow chow, cluster beans, colacasia, coriander(leaves), cowpea(veg), cucumbar(kheera), drumstick, elephant yam(suran), french beans(frasbean), garlic, ginger(green), green chilli, green peas, knool khol, ladies finger, leafy vegetable, lemon, lime, little gourd(kundru), long melon(kakri), methi(leaves), mint(pudina), mushrooms, onion, onion green, peas cod, peas wet, pointed gourd(parval), potato, pumpkin, raddish, ridgeguard(tori), round gourd, season leaves, snake gourd, spinach, sponge gourd, squash, sweet potato, taro leaves, tinda, tomato, turnip, yam(ratalu)
-Fruits: amla, apple, banana, banana - green, ber, chikoos(sapota), custard apple, grapes, guava, jack fruit, karbuja(musk melon), kinnow, kiwi, mango, mango(raw-ripe), mousambi(sweet lime), orange, papaya, papaya(raw), pear, pineapple, plum, pomegranate, tamarind fruit, water melon
-Grains & Pulses: arhar dal, arhar(tur/red gram), bajra(pearl millet), barley(jau), bengal gram dal, bengal gram(whole), black gram dal, black gram(urd), foxtail millet, green gram dal, green gram(moong), jowar(sorghum), kabuli chana, kulthi(horse gram), lentil(masur), maize, paddy(basmati), paddy(common), ragi(finger millet), red gram, rice, wheat, white peas
-Spices: ajwan, black pepper, chili red, dry chillies, coriander seed, cummin seed(jeera), ginger(dry), methi seeds, mustard, pepper garbled, poppy seeds, turmeric
-Oilseeds: castor seed, coconut, copra, groundnut, linseed, safflower, sesamum(til), soyabean, sunflower
-Cash Crops: arecanut(supari), betel leaves, coffee, cotton, gur(jaggery), jaggery, jute, rubber, sugarcane, tapioca`;
+// All commodity names in the database (Title Case) - helps LLM map colloquial names to official ones
+const COMMODITIES = `Vegetables: Amaranthus, Ashgourd, Beans, Beetroot, Bhindi(Ladies Finger), Bitter Gourd, Bottle Gourd, Brinjal, Bunch Beans, Cabbage, Capsicum, Carrot, Cauliflower, Chow Chow, Cluster Beans, Colacasia, Coriander(Leaves), Cowpea(Veg), Cucumbar(Kheera), Drumstick, Elephant Yam(Suran), French Beans(Frasbean), Garlic, Ginger(Green), Green Chilli, Green Peas, Knool Khol, Ladies Finger, Leafy Vegetable, Lemon, Lime, Little Gourd(Kundru), Long Melon(Kakri), Methi(Leaves), Mint(Pudina), Mushrooms, Onion, Onion Green, Peas Cod, Peas Wet, Pointed Gourd(Parval), Potato, Pumpkin, Raddish, Ridgeguard(Tori), Round Gourd, Season Leaves, Snake Gourd, Spinach, Sponge Gourd, Squash, Sweet Potato, Taro Leaves, Tinda, Tomato, Turnip, Yam(Ratalu)
+Fruits: Amla, Apple, Banana, Banana - Green, Ber, Chikoos(Sapota), Custard Apple, Grapes, Guava, Jack Fruit, Karbuja(Musk Melon), Kinnow, Kiwi, Mango, Mango(Raw-Ripe), Mousambi(Sweet Lime), Orange, Papaya, Papaya(Raw), Pear, Pineapple, Plum, Pomegranate, Tamarind Fruit, Water Melon
+Grains & Pulses: Arhar Dal, Arhar(Tur/Red Gram), Bajra(Pearl Millet), Barley(Jau), Bengal Gram Dal, Bengal Gram(Whole), Black Gram Dal, Black Gram(Urd), Foxtail Millet, Green Gram Dal, Green Gram(Moong), Jowar(Sorghum), Kabuli Chana, Kulthi(Horse Gram), Lentil(Masur), Maize, Paddy(Basmati), Paddy(Common), Ragi(Finger Millet), Red Gram, Rice, Wheat, White Peas
+Spices: Ajwan, Black Pepper, Chili Red, Dry Chillies, Coriander Seed, Cummin Seed(Jeera), Ginger(Dry), Methi Seeds, Mustard, Pepper Garbled, Poppy Seeds, Turmeric
+Oilseeds: Castor Seed, Coconut, Copra, Groundnut, Linseed, Safflower, Sesamum(Til), Soyabean, Sunflower
+Cash Crops: Arecanut(Supari), Betel Leaves, Coffee, Cotton, Gur(Jaggery), Jaggery, Jute, Rubber, Sugarcane, Tapioca`;
 
-const SQL_PROMPT = `You convert user questions about Indian mandi (agricultural market) prices into SQL queries.
+const log = (...args) => console.log("[api/chat]", ...args);
+const encoder = new TextEncoder();
+
+// Pricing per 1M tokens (in USD)
+const PRICING = {
+  "gpt-4.1-nano": { input: 0.1, output: 0.4 },
+  "gpt-5.1": { input: 1.25, output: 10 },
+};
+
+function calculateCost(nanoTokens = {}, gpt5Tokens = {}) {
+  const nanoCost =
+    ((nanoTokens.input || 0) * PRICING["gpt-4.1-nano"].input +
+      (nanoTokens.output || 0) * PRICING["gpt-4.1-nano"].output) /
+    1_000_000;
+  const gpt5Cost =
+    ((gpt5Tokens.input || 0) * PRICING["gpt-5.1"].input +
+      (gpt5Tokens.output || 0) * PRICING["gpt-5.1"].output) /
+    1_000_000;
+  return { nanoCost, gpt5Cost, totalCost: nanoCost + gpt5Cost };
+}
+
+const LOCATION_RESOLVER_PROMPT = `You map a user's mentioned place to state and district from provided lists.
+
+Return ONLY valid JSON (no markdown):
+{"state": string|null, "district": string|null, "confidence": number, "reason": string}
+
+Rules:
+- state/district must be EXACTLY from the provided lists, or null if you can't decide.
+- confidence is 0 to 1. Be conservative: if ambiguous, return null with low confidence.
+- If the place IS a district in the list, set district to that exact value.
+- If the place is a city/town/village, find its parent district.
+- Common mappings: Kurla/Andheri/Bandra → Mumbai or Mumbai Suburban; Kalyan/Thane → Thane; Pune city → Pune.`;
+
+const buildSqlPrompt = (locationContext) => {
+  let locationHint = "";
+  if (locationContext) {
+    const { requestedPlace, state, district, searchTerms } = locationContext;
+    locationHint = `\nLocation context for this query:
+- User asked about: "${requestedPlace}"
+- Resolved state: ${state || "unknown"}
+- Resolved district: ${district || "none (user mentioned state only)"}`;
+
+    if (district) {
+      // User mentioned a specific place/district - search both place and district
+      locationHint += `\n- Search terms for district/market: ${JSON.stringify(
+        searchTerms
+      )}
+- Filter: state ILIKE '%${state}%' AND (district ILIKE '%${
+        searchTerms[0]
+      }%' OR market ILIKE '%${searchTerms[0]}%'${
+        searchTerms[1]
+          ? ` OR district ILIKE '%${searchTerms[1]}%' OR market ILIKE '%${searchTerms[1]}%'`
+          : ""
+      })`;
+    } else if (state) {
+      // User only mentioned a state - just filter by state, no district/market filter needed
+      locationHint += `\n- Filter by state only: state ILIKE '%${state}%'
+- Do NOT add district/market filters - the user wants all data from this state.`;
+    }
+  }
+
+  return `You convert user questions about Indian mandi (agricultural market) prices into SQL queries.
 
 Table: mandi_prices
 Columns: state, district, market, commodity, variety, grade, min_price, max_price, modal_price, arrival_date
@@ -19,113 +80,128 @@ Prices are in ₹/quintal (100 kg).
 
 Commodity names in database:
 ${COMMODITIES}
+${locationHint}
 
 Rules:
 - Always filter by latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
-- Case-insensitive commodity search: commodity ILIKE '%tomato%'
+- Commodity matching - use EXACT Title Case names from the COMMODITIES list above:
+  - Map user's term to the exact name: "aloo" → 'Potato', "tamatar" → 'Tomato', "pyaaz" → 'Onion'
+  - Single commodity: commodity = 'Potato' (exact match, case-sensitive)
+  - Multiple commodities: commodity IN ('Potato', 'Tomato', 'Onion')
+  - For partial/fuzzy matches only: commodity ILIKE '%partial%'
+- For category queries like "vegetables" or "fruits":
+  - Use IN(...) with the exact Title Case names from COMMODITIES
+  - Example: commodity IN ('Potato', 'Tomato', 'Onion', 'Brinjal', 'Cabbage', ...)
+  - For broad categories, include common items and add LIMIT 100
 - Use modal_price for price comparisons (cast to numeric for math/order): modal_price::numeric
-- Avoid misleading sampling for comparisons:
-  - If the user asks to compare across states/districts/markets, prefer an AGGREGATED result (e.g. one row per state) instead of returning raw rows.
-  - Example (compare across states): SELECT state, COUNT(*) AS rows, COUNT(DISTINCT market) AS markets, MIN(modal_price::numeric) AS min_modal, MAX(modal_price::numeric) AS max_modal, AVG(modal_price::numeric) AS avg_modal FROM mandi_prices WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices) AND commodity ILIKE '%potato%' AND state IN ('Tamil Nadu','Kerala') GROUP BY state ORDER BY state;
-- For "top/cheapest/highest" style questions, return raw rows but keep it bounded:
-  - Prefer SELECT DISTINCT (to avoid duplicates)
-  - Use ORDER BY with modal_price::numeric
-  - Use LIMIT between 10 and 200 depending on how many items the user asked for (never more than 200)
+- SELECT ONLY columns needed to answer the question (minimize tokens):
+  - Price queries: state, district, market, commodity, modal_price (skip variety/grade unless asked)
+  - Availability queries: DISTINCT state, commodity (or district, commodity)
+  - Comparison queries: state, commodity, modal_price (aggregated)
+  - Only include variety/grade/min_price/max_price if specifically relevant
+- For location filtering, use the provided search terms if available:
+  - Example: (district ILIKE '%term1%' OR market ILIKE '%term1%' OR district ILIKE '%term2%' OR market ILIKE '%term2%')
+  - Also filter by state if provided: AND state ILIKE '%Maharashtra%'
+  - If user mentions a state (like Gujarat), filter by state but DON'T also require district/market to match the state name.
+- For comparisons across states/districts, use aggregates (GROUP BY) instead of raw rows.
+- For "top/cheapest/highest" queries: SELECT DISTINCT, ORDER BY modal_price::numeric, LIMIT 10-200.
 - NEVER use SELECT *
-- If the user asks for "all data", "everything", or an unbounded dump, respond UNCLEAR
+- If the user asks for "all data" or unbounded dumps, respond UNCLEAR
 
-IMPORTANT: If the question is:
-- Gibberish, nonsensical, or unrelated to mandi/commodity prices
-- About something not in the database (weather, news, general knowledge, etc.)
-- Too vague to form a meaningful query
-
-Then respond with ONLY the word: UNCLEAR
+If the question is gibberish, unrelated, or too vague, respond with ONLY: UNCLEAR
 
 Otherwise, output ONLY the raw SQL query. No markdown, no code blocks, no explanation.`;
+};
 
-const SUMMARY_PROMPT = `You summarize mandi price data concisely. Prices are ₹/quintal; show as ₹/kg (divide by 100). Use markdown. Be direct, no preamble.`;
+const SUMMARY_PROMPT = `You summarize mandi price data concisely. Prices are ₹/quintal; show as ₹/kg (divide by 100). Use markdown. Be direct.
 
-const UNCLEAR_PROMPT = `You are Ask Mandi, a mandi-price assistant. The SQL planner signaled that the user's request can't be answered (gibberish, unrelated, or too vague).
+Critical rules:
+- If data is provided below, it EXISTS in our database. Never say "no data" or "not available" when data is provided.
+- If "Preface already sent" is provided, do NOT repeat it. Continue naturally after it.
+- Focus on answering the user's question with the provided data.
+- List specific items from the data (states, commodities, markets) to prove the data exists.
+- Be factual: if data shows 5 states, say "data for 5 states" not "I don't have data".`;
+
+const UNCLEAR_PROMPT = `You are Ask Mandi, a mandi-price assistant. The user's request can't be answered.
 
 Write a short, friendly response that:
-- Clearly states you couldn't understand or the data isn't available for that request.
-- Provides 2-3 specific example questions the user can ask about mandi prices.
+- Clearly states you couldn't understand or the data isn't available.
+- Provides 2-3 specific example questions about mandi prices.
 
-Keep it under 3 short paragraphs. Avoid repeating the user's gibberish.`;
+Keep it under 3 short paragraphs.`;
 
-const log = (...args) => console.log("[api/chat]", ...args);
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-const encoder = new TextEncoder();
-
-function normalizeUsage(raw = {}) {
-  const inputTokens =
-    raw.inputTokens ?? raw.promptTokens ?? raw.totalPromptTokens ?? 0;
-  const outputTokens =
-    raw.outputTokens ?? raw.completionTokens ?? raw.totalCompletionTokens ?? 0;
-  const totalTokens =
-    raw.totalTokens ?? raw.total_usage ?? inputTokens + outputTokens;
-
-  return {
-    inputTokens,
-    outputTokens,
-    totalTokens: totalTokens || inputTokens + outputTokens,
-  };
+function sanitize(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[^a-z0-9\s().,-]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60);
 }
 
-function addUsage(a, b) {
-  return {
-    inputTokens: (a.inputTokens || 0) + (b.inputTokens || 0),
-    outputTokens: (a.outputTokens || 0) + (b.outputTokens || 0),
-    totalTokens: (a.totalTokens || 0) + (b.totalTokens || 0),
-  };
+function extractLocationHint(text) {
+  const s = String(text || "").trim();
+  if (!s) return null;
+
+  // Skip location extraction for comparison/exclusion queries
+  // These need the full query context, not just location filtering
+  const comparisonPatterns = [
+    /\b(?:but\s+not|not\s+in|except|excluding|only\s+in|unique\s+to)\b/i,
+    /\bavailable\s+.*\bbut\b/i,
+    /\bcompare\b.*\b(?:with|to|and)\b/i,
+    /\bwhat\s+(?:states?|districts?|data)\s+do\s+you\s+have\b/i,
+  ];
+  if (comparisonPatterns.some((p) => p.test(s))) return null;
+
+  const m = s.match(/\b(?:in|near|around|at)\s+([a-z][a-z\s().,-]{2,60})/i);
+  if (!m) return null;
+  const raw = m[1].split(/[?.!,;:\n]/)[0].trim();
+  const cleaned = sanitize(raw);
+  if (!cleaned || cleaned.length < 3) return null;
+  if (["india", "today", "yesterday", "now"].includes(cleaned.toLowerCase()))
+    return null;
+  return cleaned;
 }
 
-function extractSqlFromResponse(text) {
+function isSafeSelect(sql) {
+  const s = String(sql || "")
+    .trim()
+    .toLowerCase();
+  if (!s || !s.startsWith("select")) return false;
+  if (/[;](?!\s*$)/.test(s)) return false;
+  if (
+    /\b(insert|update|delete|drop|alter|create|truncate|grant|revoke)\b/.test(s)
+  )
+    return false;
+  return true;
+}
+
+function extractSql(text) {
   if (!text) return null;
-
-  // Strip markdown code blocks if present
   let sql = text.trim();
-
-  // Remove ```sql ... ``` or ``` ... ```
-  const codeBlockMatch = sql.match(/```(?:sql)?\s*([\s\S]*?)```/i);
-  if (codeBlockMatch) {
-    sql = codeBlockMatch[1].trim();
-  }
-
+  const match = sql.match(/```(?:sql)?\s*([\s\S]*?)```/i);
+  if (match) sql = match[1].trim();
   return sql || null;
 }
 
-function sanitizeSql(sql) {
-  if (!sql) return sql;
-
-  const trimmed = sql.trim();
-  const hasGroupBy = /\bGROUP\s+BY\b/i.test(trimmed);
-  const hasAggregate =
-    /\b(COUNT|AVG|MIN|MAX|SUM|PERCENTILE_CONT|PERCENTILE_DISC)\s*\(/i.test(
-      trimmed
-    );
-  const limitMatch = trimmed.match(/\bLIMIT\s+(\d+)\b/i);
-
-  // If the query returns raw rows without any aggregation, enforce a reasonable bound.
-  if (!limitMatch && !hasGroupBy && !hasAggregate) {
-    return trimmed.replace(/;?\s*$/, "\nLIMIT 200;");
+function extractJson(text) {
+  try {
+    const raw = String(text || "").trim();
+    const s = raw.startsWith('"') ? JSON.parse(raw) : raw;
+    const start = s.indexOf("{");
+    const end = s.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) return null;
+    return JSON.parse(s.slice(start, end + 1));
+  } catch {
+    return null;
   }
-
-  // If present, clamp extreme limits.
-  if (limitMatch) {
-    const n = Number(limitMatch[1]);
-    if (Number.isFinite(n) && n > 500) {
-      return trimmed.replace(/\bLIMIT\s+\d+\b/i, "LIMIT 500");
-    }
-    if (Number.isFinite(n) && n <= 0) {
-      return trimmed.replace(/\bLIMIT\s+\d+\b/i, "LIMIT 200");
-    }
-  }
-
-  return trimmed;
 }
 
-function extractJsonFromMcpResult(result) {
+function parseDbResult(result) {
   try {
     const rawText = result?.content?.[0]?.text || "";
     const text = rawText.startsWith('"') ? JSON.parse(rawText) : rawText;
@@ -137,10 +213,167 @@ function extractJsonFromMcpResult(result) {
   }
 }
 
+function normalizeUsage(raw = {}) {
+  const i = raw.inputTokens ?? raw.promptTokens ?? 0;
+  const o = raw.outputTokens ?? raw.completionTokens ?? 0;
+  return {
+    inputTokens: i,
+    outputTokens: o,
+    totalTokens: raw.totalTokens ?? i + o,
+  };
+}
+
+function addUsage(a, b) {
+  return {
+    inputTokens: (a.inputTokens || 0) + (b.inputTokens || 0),
+    outputTokens: (a.outputTokens || 0) + (b.outputTokens || 0),
+    totalTokens: (a.totalTokens || 0) + (b.totalTokens || 0),
+  };
+}
+
+// Check if any row contains the place (word-boundary match)
+function rowContainsPlace(row, place) {
+  if (!row || !place) return false;
+  const tokens = sanitize(place)
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length >= 3);
+  if (!tokens.length) return false;
+
+  const fields = [row.district, row.market, row.state]
+    .filter(Boolean)
+    .map((v) => String(v).toLowerCase());
+
+  const match = (text, token) => {
+    const esc = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, "i").test(text);
+  };
+
+  return fields.some((f) => tokens.every((t) => match(f, t)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DB cache (states/districts)
+// ─────────────────────────────────────────────────────────────────────────────
+
+let statesCache = null;
+let statesCacheAt = 0;
+const districtsCache = new Map();
+const CACHE_TTL = 30 * 60 * 1000; // 30 min
+
+async function getStates(runQuery) {
+  if (statesCache && Date.now() - statesCacheAt < CACHE_TTL) return statesCache;
+  const rows = await runQuery(
+    "SELECT DISTINCT state FROM mandi_prices ORDER BY state;"
+  );
+  statesCache = rows.map((r) => r.state).filter(Boolean);
+  statesCacheAt = Date.now();
+  return statesCache;
+}
+
+async function getDistricts(runQuery, state) {
+  const key = String(state).toLowerCase();
+  const cached = districtsCache.get(key);
+  if (cached && Date.now() - cached.at < CACHE_TTL) return cached.districts;
+
+  const s = sanitize(state).replace(/'/g, "''");
+  const rows = await runQuery(
+    `SELECT DISTINCT district FROM mandi_prices WHERE state ILIKE '%${s}%' ORDER BY district;`
+  );
+  const districts = rows.map((r) => r.district).filter(Boolean);
+  districtsCache.set(key, { districts, at: Date.now() });
+  return districts;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Location resolution (BEFORE SQL generation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function resolveLocation(runQuery, requestedPlace, userMessage) {
+  // Step 1: Get all states from DB
+  const states = await getStates(runQuery);
+
+  // Step 2: Check if user explicitly mentioned a state
+  const msgLower = userMessage.toLowerCase();
+  let state = states.find((s) => msgLower.includes(s.toLowerCase())) || null;
+
+  // Step 3: If no explicit state, use LLM to infer from place name
+  let usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  let district = null;
+
+  if (!state) {
+    // Single LLM call: resolve both state and district together
+    // First get a reasonable subset of districts (top states by data volume or all)
+    // For simplicity, we'll do a two-step: state first, then district
+    const stateResult = await generateText({
+      model: openai("gpt-4.1-nano"),
+      system: `You identify which Indian state a place belongs to.
+Return ONLY valid JSON: {"state": string|null, "confidence": number}
+The state must be EXACTLY one of these: ${JSON.stringify(states)}
+Common: Kurla/Mumbai/Thane → Maharashtra; Kolkata → West Bengal; Chennai → Tamil Nadu; Bangalore → Karnataka.`,
+      prompt: `Place: ${requestedPlace}`,
+      maxTokens: 80,
+    });
+    usage = addUsage(usage, normalizeUsage(stateResult.usage));
+
+    const parsed = extractJson(stateResult.text);
+    if (parsed?.state && Number(parsed.confidence) >= 0.5) {
+      state = parsed.state;
+    }
+  }
+
+  // Step 4: If we have a state, resolve district
+  if (state) {
+    const districts = await getDistricts(runQuery, state);
+
+    // Check if requestedPlace IS a district (exact match)
+    district =
+      districts.find((d) => d.toLowerCase() === requestedPlace.toLowerCase()) ||
+      null;
+
+    // If not exact, use LLM to find parent district
+    if (!district && districts.length > 0) {
+      const distResult = await generateText({
+        model: openai("gpt-4.1-nano"),
+        system: LOCATION_RESOLVER_PROMPT,
+        prompt: `State: ${state}
+Place: ${requestedPlace}
+Districts in ${state}: ${JSON.stringify(districts)}`,
+        maxTokens: 100,
+      });
+      usage = addUsage(usage, normalizeUsage(distResult.usage));
+
+      const parsed = extractJson(distResult.text);
+      if (parsed?.district && Number(parsed.confidence) >= 0.5) {
+        district = parsed.district;
+      }
+    }
+  }
+
+  // Build search terms: always include user's place + resolved district if different
+  const searchTerms = [requestedPlace];
+  if (district && district.toLowerCase() !== requestedPlace.toLowerCase()) {
+    searchTerms.push(district);
+  }
+
+  return {
+    requestedPlace,
+    state,
+    district,
+    searchTerms,
+    isExact: district?.toLowerCase() === requestedPlace.toLowerCase(),
+    usage,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main handler
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function POST(req) {
   const { messages } = await req.json();
 
-  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+  if (!messages?.length) {
     return Response.json(
       { error: "Messages array is required" },
       { status: 400 }
@@ -151,59 +384,19 @@ export async function POST(req) {
     [...messages].reverse().find((m) => m?.role === "user")?.content || "";
   log("Incoming request", { lastUser: lastUserMessage });
 
+  const requestedPlace = extractLocationHint(lastUserMessage);
   let mcpClient = null;
 
   try {
     const projectRef = process.env.SUPABASE_PROJECT_REF;
-    if (!projectRef) {
-      throw new Error("SUPABASE_PROJECT_REF is not configured");
-    }
     const pat = process.env.SUPABASE_PAT;
-    if (!pat) {
-      throw new Error("SUPABASE_PAT is not configured");
+    if (!projectRef || !pat) {
+      throw new Error(
+        "SUPABASE_PROJECT_REF and SUPABASE_PAT must be configured"
+      );
     }
 
-    // Phase 1: Generate SQL query
-    const sqlResult = await generateText({
-      model: openai("gpt-5.1"),
-      system: SQL_PROMPT,
-      prompt: lastUserMessage,
-      maxTokens: 200,
-      reasoningEffort: "low",
-    });
-
-    const rawResponse = (sqlResult.text || "").trim();
-    log("SQL model response:", rawResponse);
-    log("SQL generation tokens:", sqlResult.usage);
-
-    // Handle unclear/invalid queries
-    if (rawResponse.toUpperCase() === "UNCLEAR" || !rawResponse) {
-      const clarification = await generateText({
-        model: openai("gpt-4.1-nano"),
-        system: UNCLEAR_PROMPT,
-        prompt: `User message: ${lastUserMessage}`,
-        maxTokens: 200,
-      });
-
-      const sqlUsage = normalizeUsage(sqlResult.usage);
-      const clarUsage = normalizeUsage(clarification.usage);
-
-      return Response.json({
-        message:
-          clarification.text ||
-          "I couldn't understand your question. Please ask something specific about mandi prices.",
-        usage: addUsage(sqlUsage, clarUsage),
-      });
-    }
-
-    const sqlQuery = extractSqlFromResponse(rawResponse);
-
-    if (!sqlQuery) {
-      throw new Error("Failed to generate SQL query");
-    }
-    const safeSqlQuery = sanitizeSql(sqlQuery);
-
-    // Phase 2: Execute SQL via MCP
+    // Connect to MCP
     mcpClient = await createMCPClient({
       transport: {
         type: "http",
@@ -211,34 +404,141 @@ export async function POST(req) {
         headers: { Authorization: `Bearer ${pat}` },
       },
     });
-
     const mcpTools = await mcpClient.tools();
-    if (!mcpTools.execute_sql) {
-      throw new Error("MCP did not expose the execute_sql tool");
+    if (!mcpTools.execute_sql)
+      throw new Error("MCP did not expose execute_sql");
+
+    const runQuery = async (query) => {
+      if (!isSafeSelect(query)) throw new Error("Unsafe query blocked");
+      const res = await mcpTools.execute_sql.execute({ query });
+      return parseDbResult(res);
+    };
+
+    let totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    let nanoTokens = { input: 0, output: 0 };
+    let gpt5Tokens = { input: 0, output: 0 };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 1: Resolve location BEFORE generating SQL
+    // ─────────────────────────────────────────────────────────────────────────
+    let locationContext = null;
+    if (requestedPlace) {
+      locationContext = await resolveLocation(
+        runQuery,
+        requestedPlace,
+        lastUserMessage
+      );
+      totalUsage = addUsage(totalUsage, locationContext.usage);
+      nanoTokens.input += locationContext.usage.inputTokens || 0;
+      nanoTokens.output += locationContext.usage.outputTokens || 0;
+      log("Location resolved", {
+        place: requestedPlace,
+        state: locationContext.state,
+        district: locationContext.district,
+        terms: locationContext.searchTerms,
+      });
     }
 
-    const sqlData = await mcpTools.execute_sql.execute({ query: safeSqlQuery });
-    const data = extractJsonFromMcpResult(sqlData);
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 2: Generate SQL with location context
+    // ─────────────────────────────────────────────────────────────────────────
+    const sqlPrompt = buildSqlPrompt(locationContext);
+    const sqlResult = await generateText({
+      model: openai("gpt-5.1"),
+      system: sqlPrompt,
+      prompt: lastUserMessage,
+      maxTokens: 250,
+      reasoningEffort: "low",
+    });
+    const sqlUsage = normalizeUsage(sqlResult.usage);
+    totalUsage = addUsage(totalUsage, sqlUsage);
+    gpt5Tokens.input += sqlUsage.inputTokens || 0;
+    gpt5Tokens.output += sqlUsage.outputTokens || 0;
 
-    // Close MCP client early
+    const rawSql = (sqlResult.text || "").trim();
+    log("SQL model response:", rawSql);
+
+    // Handle unclear queries
+    if (rawSql.toUpperCase() === "UNCLEAR" || !rawSql) {
+      const clarification = await generateText({
+        model: openai("gpt-4.1-nano"),
+        system: UNCLEAR_PROMPT,
+        prompt: `User message: ${lastUserMessage}`,
+        maxTokens: 200,
+      });
+      const clarUsage = normalizeUsage(clarification.usage);
+      totalUsage = addUsage(totalUsage, clarUsage);
+      nanoTokens.input += clarUsage.inputTokens || 0;
+      nanoTokens.output += clarUsage.outputTokens || 0;
+
+      const cost = calculateCost(nanoTokens, gpt5Tokens);
+      log("Cost (unclear):", { total: `$${cost.totalCost.toFixed(6)}` });
+
+      if (mcpClient?.close) await mcpClient.close();
+      return Response.json({
+        message:
+          clarification.text ||
+          "I couldn't understand. Try asking about mandi prices.",
+        usage: totalUsage,
+      });
+    }
+
+    const sql = extractSql(rawSql);
+    if (!sql || !isSafeSelect(sql)) {
+      throw new Error("Failed to generate safe SQL query");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 3: Execute SQL (single query, no reruns!)
+    // ─────────────────────────────────────────────────────────────────────────
+    let data = await runQuery(sql);
+    log("SQL returned", data.length, "rows");
+
+    // Check if we got an exact match for the requested place
+    let exactMatch = false;
+    if (requestedPlace && data.length > 0) {
+      exactMatch = data.some((row) => rowContainsPlace(row, requestedPlace));
+    }
+
+    // If no data and we have location context, try a broader fallback (state-level)
+    if (data.length === 0 && locationContext?.state) {
+      // Extract commodity from the generated SQL
+      const commodityMatch = sql.match(/commodity\s+ilike\s+'%([^%']+)%'/i);
+      const commodity = commodityMatch?.[1];
+
+      if (commodity) {
+        const st = sanitize(locationContext.state).replace(/'/g, "''");
+        const fallbackSql = `SELECT DISTINCT state, district, market, variety, grade, min_price, max_price, modal_price
+FROM mandi_prices
+WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
+  AND commodity ILIKE '%${commodity}%'
+  AND state ILIKE '%${st}%'
+ORDER BY modal_price::numeric
+LIMIT 50;`;
+        data = await runQuery(fallbackSql);
+        log("Fallback to state-level returned", data.length, "rows");
+      }
+    }
+
+    // Close MCP early
     if (mcpClient?.close) {
       await mcpClient.close();
       mcpClient = null;
     }
 
-    log("SQL returned", data.length, "rows");
-
-    const sqlUsage = normalizeUsage(sqlResult.usage);
-
+    // No data at all
     if (data.length === 0) {
       return Response.json({
-        message:
-          "No results found for your query. Try checking the commodity name or broadening your search.",
-        usage: sqlUsage,
+        message: requestedPlace
+          ? `No results found for **${requestedPlace}** on the latest date. Try a nearby district or the whole state.`
+          : "No results found. Try checking the commodity name or broadening your search.",
+        usage: totalUsage,
       });
     }
 
-    // Encode data as TOON for efficiency
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 4: Stream summary
+    // ─────────────────────────────────────────────────────────────────────────
     const toonData = toToon(data);
     log(
       "TOON:",
@@ -248,18 +548,53 @@ export async function POST(req) {
       "chars"
     );
 
-    // Phase 3: Stream the summary
+    // Build honest prefix when we couldn't match exact place
+    // Skip if requestedPlace is essentially the same as resolved location (case-insensitive)
+    let forcedPrefix = "";
+    if (requestedPlace && !exactMatch) {
+      const showing =
+        locationContext?.district || locationContext?.state || "available data";
+      const isSameLocation =
+        showing.toLowerCase() === requestedPlace.toLowerCase();
+      if (!isSameLocation) {
+        forcedPrefix = `No data for **${requestedPlace}** on the latest date. Showing **${showing}** instead.\n\n`;
+      }
+    }
+
     const summaryResult = streamText({
       model: openai("gpt-4.1-nano"),
       system: SUMMARY_PROMPT,
-      prompt: `Question: ${lastUserMessage}\n\nData:\n${toonData}\n\nProvide a helpful, concise answer.`,
+      prompt: `Question: ${lastUserMessage}
+
+${forcedPrefix ? `Preface already sent: "${forcedPrefix.trim()}"` : ""}
+
+Data:
+${toonData}
+
+Provide a helpful, concise answer.`,
       maxTokens: 300,
+      temperature: 0, // Deterministic output
     });
 
+    // Stream response
     const stream = new ReadableStream({
       async start(controller) {
         try {
           let fullText = "";
+
+          // Send forced prefix first
+          if (forcedPrefix) {
+            fullText += forcedPrefix;
+            controller.enqueue(
+              encoder.encode(
+                `event: delta\ndata:${JSON.stringify({
+                  delta: forcedPrefix,
+                })}\n\n`
+              )
+            );
+          }
+
+          // Stream LLM response
           for await (const delta of summaryResult.textStream) {
             fullText += delta;
             controller.enqueue(
@@ -269,15 +604,26 @@ export async function POST(req) {
             );
           }
 
-          const summaryUsageRaw = await summaryResult.usage.catch(() => ({}));
-          const summaryUsage = normalizeUsage(summaryUsageRaw);
-          const totalUsage = addUsage(sqlUsage, summaryUsage);
+          const summaryUsage = normalizeUsage(
+            await summaryResult.usage.catch(() => ({}))
+          );
+          nanoTokens.input += summaryUsage.inputTokens || 0;
+          nanoTokens.output += summaryUsage.outputTokens || 0;
+          const finalUsage = addUsage(totalUsage, summaryUsage);
+
+          // Log cost breakdown
+          const cost = calculateCost(nanoTokens, gpt5Tokens);
+          log("Cost:", {
+            nano: `$${cost.nanoCost.toFixed(6)}`,
+            gpt5: `$${cost.gpt5Cost.toFixed(6)}`,
+            total: `$${cost.totalCost.toFixed(6)}`,
+          });
 
           controller.enqueue(
             encoder.encode(
               `event: done\ndata:${JSON.stringify({
                 fullText,
-                usage: totalUsage,
+                usage: finalUsage,
               })}\n\n`
             )
           );
@@ -286,7 +632,7 @@ export async function POST(req) {
           controller.enqueue(
             encoder.encode(
               `event: error\ndata:${JSON.stringify({
-                message: err?.message || "Stream interrupted",
+                message: err?.message || "Stream error",
               })}\n\n`
             )
           );
@@ -300,18 +646,15 @@ export async function POST(req) {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
-        "Transfer-Encoding": "chunked",
       },
     });
   } catch (error) {
     console.error("[api/chat] Error", error);
-
     if (mcpClient?.close) {
       try {
         await mcpClient.close();
       } catch {}
     }
-
     return Response.json(
       { error: "Failed to process your question", details: error.message },
       { status: 500 }
