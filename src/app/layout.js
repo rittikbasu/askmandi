@@ -14,9 +14,31 @@ const geistMono = Geist_Mono({
 export const metadata = {
   title: "Ask Mandi",
   description:
-    "Get instant answers about commodity prices from 900+ agricultural markets across India. Compare rates, find the cheapest markets, and track price trends all in plain language.",
+    "Get instant answers about commodity prices from 900+ agricultural markets across India. Compare rates, find the cheapest markets and track price trends all in plain language.",
+  metadataBase: new URL(`https://${process.env.VERCEL_URL}`),
   icons: {
     icon: "/favicon.png",
+  },
+  openGraph: {
+    title: "Ask Mandi",
+    description:
+      "Get instant answers about commodity prices from 900+ agricultural markets across India. Compare rates, find the cheapest markets and track price trends all in plain language.",
+    type: "website",
+    images: [
+      {
+        url: "/og.png",
+        width: 1200,
+        height: 630,
+        alt: "Ask Mandi",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Ask Mandi",
+    description:
+      "Get instant answers about commodity prices from 900+ agricultural markets across India. Compare rates, find the cheapest markets and track price trends all in plain language.",
+    images: ["/og.png"],
   },
 };
 
