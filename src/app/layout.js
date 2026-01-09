@@ -20,17 +20,21 @@ export const metadata = {
   icons: {
     icon: "/favicon.png",
   },
+  themeColor: "#000000",
   openGraph: {
     title: "Ask Mandi",
     description:
       "Get instant answers about commodity prices from 900+ agricultural markets across India. Compare rates, find the cheapest markets and track price trends all in plain language.",
     type: "website",
+    url: process.env.NEXT_PUBLIC_SITE_URL,
+    siteName: "Ask Mandi",
     images: [
       {
         url: "/og.png",
         width: 1200,
         height: 630,
         alt: "Ask Mandi",
+        type: "image/png",
       },
     ],
   },
