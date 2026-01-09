@@ -16,7 +16,7 @@ export const metadata = {
   title: "Ask Mandi",
   description:
     "Get instant answers about commodity prices from 900+ agricultural markets across India. Compare rates, find the cheapest markets and track price trends all in plain language.",
-  metadataBase: new URL(`https://${process.env.NEXT_PUBLIC_SITE_URL}`),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL),
   icons: {
     icon: "/favicon.png",
   },
