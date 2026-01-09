@@ -21,6 +21,51 @@ const WELCOME_MESSAGE = {
 Whether you're a farmer checking today's rates, a trader comparing prices across states, or just curious about market trends ask in plain language and get answers in seconds.`,
 };
 
+const QUOTA_KEY = "askmandi:quota";
+
+function useRateLimit() {
+  const [resetTime, setResetTime] = useState(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      const stored = localStorage.getItem(QUOTA_KEY);
+      if (stored) {
+        const { reset } = JSON.parse(stored);
+        if (reset && reset > Date.now()) {
+          return reset;
+        } else {
+          localStorage.removeItem(QUOTA_KEY);
+        }
+      }
+    } catch {}
+    return null;
+  });
+
+  const setQuota = (remaining, reset) => {
+    if (typeof window === "undefined") return;
+    try {
+      if (remaining === 0) {
+        // Fallback to 24h if no reset time provided
+        const effectiveReset = reset || Date.now() + 24 * 60 * 60 * 1000;
+        localStorage.setItem(
+          QUOTA_KEY,
+          JSON.stringify({ remaining, reset: effectiveReset })
+        );
+        setResetTime(effectiveReset);
+      } else {
+        localStorage.setItem(QUOTA_KEY, JSON.stringify({ remaining, reset }));
+      }
+    } catch {}
+  };
+
+  const clearQuota = () => {
+    if (typeof window === "undefined") return;
+    localStorage.removeItem(QUOTA_KEY);
+    setResetTime(null);
+  };
+
+  return { isRateLimited: !!resetTime, resetTime, setQuota, clearQuota };
+}
+
 const toPlainText = (input) => {
   const src = String(input ?? "");
   return src
@@ -54,45 +99,37 @@ const writeClipboard = async (text) => {
   }
 };
 
-// localStorage quota tracking (avoids unnecessary API calls when limit reached)
-const QUOTA_KEY = "askmandi:remaining";
-const QUOTA_TIMESTAMP_KEY = "askmandi:timestamp";
-const QUOTA_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
+const TimeRemaining = ({ resetTimestamp, onExpire }) => {
+  const [timeLeft, setTimeLeft] = useState("");
 
-const getStoredQuota = () => {
-  if (typeof window === "undefined") return null;
-  try {
-    const val = localStorage.getItem(QUOTA_KEY);
-    if (val === null) return null;
+  useEffect(() => {
+    const updateTimeLeft = () => {
+      const diff = resetTimestamp - Date.now();
 
-    const quota = parseInt(val, 10);
-
-    if (quota === 0) {
-      const timestamp = localStorage.getItem(QUOTA_TIMESTAMP_KEY);
-      if (
-        timestamp &&
-        Date.now() - parseInt(timestamp, 10) >= QUOTA_EXPIRY_MS
-      ) {
-        localStorage.removeItem(QUOTA_KEY);
-        localStorage.removeItem(QUOTA_TIMESTAMP_KEY);
-        return null;
+      if (diff <= 0) {
+        onExpire?.();
+        return;
       }
-    }
 
-    return quota;
-  } catch {
-    return null;
-  }
-};
+      const hours = Math.floor(diff / (1000 * 60 * 60));
+      const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+      const seconds = Math.floor((diff % (1000 * 60)) / 1000);
 
-const setStoredQuota = (remaining) => {
-  if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(QUOTA_KEY, String(remaining));
-    if (remaining === 0) {
-      localStorage.setItem(QUOTA_TIMESTAMP_KEY, String(Date.now()));
-    }
-  } catch {}
+      if (hours > 0) {
+        setTimeLeft(`${hours}h ${minutes}m`);
+      } else if (minutes > 0) {
+        setTimeLeft(`${minutes}m ${seconds}s`);
+      } else {
+        setTimeLeft(`${seconds}s`);
+      }
+    };
+
+    updateTimeLeft();
+    const interval = setInterval(updateTimeLeft, 1000);
+    return () => clearInterval(interval);
+  }, [resetTimestamp, onExpire]);
+
+  return timeLeft ? <span className="font-mono">{timeLeft}</span> : null;
 };
 
 export default function Home() {
@@ -106,6 +143,8 @@ export default function Home() {
   const streamDraftRef = useRef("");
   const streamFlushTimerRef = useRef(null);
   const lastScrollAtRef = useRef(0);
+
+  const { isRateLimited, resetTime, setQuota, clearQuota } = useRateLimit();
 
   const scrollToBottom = useCallback((behavior = "auto") => {
     messagesEndRef.current?.scrollIntoView({ behavior });
@@ -170,17 +209,17 @@ export default function Home() {
   const sendMessage = async (content) => {
     if (!content.trim() || isLoading) return;
 
-    // Check localStorage quota first (skip API call if definitely out of quota)
-    const storedQuota = getStoredQuota();
-    if (storedQuota === 0) {
+    // Check rate limit first
+    if (isRateLimited) {
       setMessages((prev) => [
         ...prev,
         { role: "user", content: content.trim() },
         {
           role: "assistant",
           content:
-            "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow :)",
+            "You've reached the daily limit of 10 questions. Please try again tomorrow :)",
           usage: null,
+          isRateLimited: true,
         },
       ]);
       setInput("");
@@ -249,9 +288,9 @@ export default function Home() {
           } else if (eventType === "done") {
             const finalText = payload?.fullText || "";
             const usage = payload?.usage || null;
-            // Update localStorage with remaining quota from backend
+            // Update quota from backend
             if (typeof payload?.remaining === "number") {
-              setStoredQuota(payload.remaining);
+              setQuota(payload.remaining);
             }
             setMessages((prev) => [
               ...prev,
@@ -287,15 +326,25 @@ export default function Home() {
       } else {
         const data = await response.json();
         if (!response.ok) {
-          // Update localStorage on rate limit error
+          // Handle rate limit error
           if (response.status === 429) {
-            setStoredQuota(0);
+            setQuota(0, data.reset);
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: data.error || "Rate limit reached",
+                usage: null,
+                isRateLimited: true,
+              },
+            ]);
+            return;
           }
           throw new Error(data.error || "Failed to get response");
         }
-        // Update localStorage with remaining quota (skip for cached responses)
+        // Update quota (skip for cached responses)
         if (typeof data.remaining === "number" && !data.cached) {
-          setStoredQuota(data.remaining);
+          setQuota(data.remaining);
         }
         setMessages((prev) => [
           ...prev,
@@ -369,6 +418,8 @@ export default function Home() {
                 message={message}
                 isWelcome={Boolean(message?.isIntro)}
                 onSuggestionClick={sendMessage}
+                rateLimitReset={message.isRateLimited ? resetTime : null}
+                onRateLimitExpire={clearQuota}
               />
             ))}
 
@@ -451,7 +502,13 @@ export default function Home() {
   );
 }
 
-function Message({ message, isWelcome = false, onSuggestionClick }) {
+function Message({
+  message,
+  isWelcome = false,
+  onSuggestionClick,
+  rateLimitReset = null,
+  onRateLimitExpire,
+}) {
   const isUser = message.role === "user";
   const [copied, setCopied] = useState(false);
   const tokenCount =
@@ -489,6 +546,21 @@ function Message({ message, isWelcome = false, onSuggestionClick }) {
             content={message.content}
             variant={isUser ? "user" : "assistant"}
           />
+
+          {/* Rate limit countdown */}
+          {(message.isRateLimited ||
+            message.content?.includes("reached the limit")) &&
+            rateLimitReset && (
+              <div className="mt-3 pt-3 border-t border-zinc-700/30">
+                <div className="text-xs text-zinc-400">
+                  Try again in:{" "}
+                  <TimeRemaining
+                    resetTimestamp={rateLimitReset}
+                    onExpire={onRateLimitExpire}
+                  />
+                </div>
+              </div>
+            )}
         </div>
 
         {/* Prompt suggestions for welcome message */}

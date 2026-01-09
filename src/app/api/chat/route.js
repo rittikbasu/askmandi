@@ -487,7 +487,7 @@ export async function POST(req) {
     return Response.json(
       {
         error:
-          "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow :)",
+          "You've reached the daily limit of 10 questions. Please try again tomorrow :)",
         remaining: 0,
         reset: rl.reset,
       },
@@ -610,7 +610,14 @@ export async function POST(req) {
 
     const sql = extractSql(rawSql);
     if (!sql || !isSafeSelect(sql)) {
-      throw new Error("Failed to generate safe SQL query");
+      log("Unsafe SQL blocked:", rawSql);
+      if (mcpClient?.close) await mcpClient.close();
+      return Response.json({
+        message:
+          "I couldn't process that request safely. Please try asking about commodity prices, markets, or trends in a different way.",
+        usage: totalUsage,
+        remaining,
+      });
     }
 
     // Phase 3: Execute SQL (single query, no reruns!)
