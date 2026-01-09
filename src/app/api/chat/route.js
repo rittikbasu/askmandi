@@ -70,19 +70,23 @@ function getVisitorKey(req) {
 // Pricing per 1M tokens (in USD)
 const PRICING = {
   "gpt-4.1-nano": { input: 0.1, output: 0.4 },
-  "gpt-5.1": { input: 1.25, output: 10 },
+  "gpt-4.1-mini": { input: 0.4, output: 1.6 },
 };
 
-function calculateCost(nanoTokens = {}, gpt5Tokens = {}) {
-  const nanoCost =
-    ((nanoTokens.input || 0) * PRICING["gpt-4.1-nano"].input +
-      (nanoTokens.output || 0) * PRICING["gpt-4.1-nano"].output) /
+function calculateCost(fourNanoTokens = {}, fourMiniTokens = {}) {
+  const fourNanoCost =
+    ((fourNanoTokens.input || 0) * PRICING["gpt-4.1-nano"].input +
+      (fourNanoTokens.output || 0) * PRICING["gpt-4.1-nano"].output) /
     1_000_000;
-  const gpt5Cost =
-    ((gpt5Tokens.input || 0) * PRICING["gpt-5.1"].input +
-      (gpt5Tokens.output || 0) * PRICING["gpt-5.1"].output) /
+  const fourMiniCost =
+    ((fourMiniTokens.input || 0) * PRICING["gpt-4.1-mini"].input +
+      (fourMiniTokens.output || 0) * PRICING["gpt-4.1-mini"].output) /
     1_000_000;
-  return { nanoCost, gpt5Cost, totalCost: nanoCost + gpt5Cost };
+  return {
+    fourNanoCost,
+    fourMiniCost,
+    totalCost: fourNanoCost + fourMiniCost,
+  };
 }
 
 const LOCATION_RESOLVER_PROMPT = `You map a user's mentioned place to state and district from provided lists.
@@ -95,7 +99,7 @@ Rules:
 - confidence is 0 to 1. Be conservative: if ambiguous, return null with low confidence.
 - If the place IS a district in the list, set district to that exact value.
 - If the place is a city/town/village, find its parent district.
-- Common mappings: Kurla/Andheri/Bandra → Mumbai or Mumbai Suburban; Kalyan/Thane → Thane; Pune city → Pune.`;
+- Common mappings: Kurla/Andheri/Bandra → Mumbai; Kalyan/Thane → Thane; Pune city → Pune.`;
 
 const buildSqlPrompt = (locationContext) => {
   let locationHint = "";
@@ -512,8 +516,8 @@ export async function POST(req) {
     };
 
     let totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    let nanoTokens = { input: 0, output: 0 };
-    let gpt5Tokens = { input: 0, output: 0 };
+    let fourNanoTokens = { input: 0, output: 0 };
+    let fourMiniTokens = { input: 0, output: 0 };
 
     // Phase 1: Resolve location BEFORE generating SQL
 
@@ -525,8 +529,8 @@ export async function POST(req) {
         lastUserMessage
       );
       totalUsage = addUsage(totalUsage, locationContext.usage);
-      nanoTokens.input += locationContext.usage.inputTokens || 0;
-      nanoTokens.output += locationContext.usage.outputTokens || 0;
+      fourNanoTokens.input += locationContext.usage.inputTokens || 0;
+      fourNanoTokens.output += locationContext.usage.outputTokens || 0;
       log("Location resolved", {
         place: requestedPlace,
         state: locationContext.state,
@@ -539,7 +543,7 @@ export async function POST(req) {
 
     const sqlPrompt = buildSqlPrompt(locationContext);
     const sqlResult = await generateText({
-      model: openai("gpt-5.1"),
+      model: openai("gpt-4.1-mini"),
       system: sqlPrompt,
       prompt: lastUserMessage,
       maxTokens: 250,
@@ -547,8 +551,8 @@ export async function POST(req) {
     });
     const sqlUsage = normalizeUsage(sqlResult.usage);
     totalUsage = addUsage(totalUsage, sqlUsage);
-    gpt5Tokens.input += sqlUsage.inputTokens || 0;
-    gpt5Tokens.output += sqlUsage.outputTokens || 0;
+    fourMiniTokens.input += sqlUsage.inputTokens || 0;
+    fourMiniTokens.output += sqlUsage.outputTokens || 0;
 
     const rawSql = (sqlResult.text || "").trim();
     log("SQL model response:", rawSql);
@@ -563,10 +567,10 @@ export async function POST(req) {
       });
       const clarUsage = normalizeUsage(clarification.usage);
       totalUsage = addUsage(totalUsage, clarUsage);
-      nanoTokens.input += clarUsage.inputTokens || 0;
-      nanoTokens.output += clarUsage.outputTokens || 0;
+      fourNanoTokens.input += clarUsage.inputTokens || 0;
+      fourNanoTokens.output += clarUsage.outputTokens || 0;
 
-      const cost = calculateCost(nanoTokens, gpt5Tokens);
+      const cost = calculateCost(fourNanoTokens, fourMiniTokens);
       log("Cost (unclear):", { total: `$${cost.totalCost.toFixed(6)}` });
 
       if (mcpClient?.close) await mcpClient.close();
@@ -702,15 +706,15 @@ Provide a helpful, concise answer.`,
           const summaryUsage = normalizeUsage(
             await summaryResult.usage.catch(() => ({}))
           );
-          nanoTokens.input += summaryUsage.inputTokens || 0;
-          nanoTokens.output += summaryUsage.outputTokens || 0;
+          fourNanoTokens.input += summaryUsage.inputTokens || 0;
+          fourNanoTokens.output += summaryUsage.outputTokens || 0;
           const finalUsage = addUsage(totalUsage, summaryUsage);
 
           // Log cost breakdown
-          const cost = calculateCost(nanoTokens, gpt5Tokens);
+          const cost = calculateCost(fourNanoTokens, fourMiniTokens);
           log("Cost:", {
-            nano: `$${cost.nanoCost.toFixed(6)}`,
-            gpt5: `$${cost.gpt5Cost.toFixed(6)}`,
+            "4nano": `$${cost.fourNanoCost.toFixed(6)}`,
+            "4mini": `$${cost.fourMiniCost.toFixed(6)}`,
             total: `$${cost.totalCost.toFixed(6)}`,
           });
 
