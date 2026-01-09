@@ -64,7 +64,20 @@ function getVisitorKey(req) {
     h.get("cf-connecting-ip") ||
     null;
   const ua = h.get("user-agent") || "unknown";
-  return `ip:${ip || "unknown"}|ua:${ua.slice(0, 80)}`;
+
+  // Normalize UA by keeping only stable parts before variable identifiers
+  // This ensures the same device gets the same rate limit bucket
+  // Stop at KHTML/like Gecko/Build which often have variable parts
+  const stopPatterns = /\s*\(KHT|\s*\(KHTML|\s+like\s+Gecko|\s+Build\//i;
+  const match = ua.match(stopPatterns);
+  const stableUA = match ? ua.substring(0, match.index) : ua;
+
+  const normalizedUA = stableUA
+    .replace(/\s+/g, " ") // Normalize whitespace
+    .trim()
+    .slice(0, 70);
+
+  return `ip:${ip || "unknown"}|ua:${normalizedUA}`;
 }
 
 // Pricing per 1M tokens (in USD)
@@ -474,7 +487,7 @@ export async function POST(req) {
     return Response.json(
       {
         error:
-          "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow.",
+          "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow :)",
         remaining: 0,
         reset: rl.reset,
       },
@@ -570,6 +583,18 @@ export async function POST(req) {
       fourNanoTokens.input += clarUsage.inputTokens || 0;
       fourNanoTokens.output += clarUsage.outputTokens || 0;
 
+      log("Tokens (unclear):", {
+        "4nano": {
+          input: fourNanoTokens.input,
+          output: fourNanoTokens.output,
+          total: fourNanoTokens.input + fourNanoTokens.output,
+        },
+        "4mini": {
+          input: fourMiniTokens.input,
+          output: fourMiniTokens.output,
+          total: fourMiniTokens.input + fourMiniTokens.output,
+        },
+      });
       const cost = calculateCost(fourNanoTokens, fourMiniTokens);
       log("Cost (unclear):", { total: `$${cost.totalCost.toFixed(6)}` });
 
@@ -710,7 +735,19 @@ Provide a helpful, concise answer.`,
           fourNanoTokens.output += summaryUsage.outputTokens || 0;
           const finalUsage = addUsage(totalUsage, summaryUsage);
 
-          // Log cost breakdown
+          // Log token usage and cost breakdown
+          log("Tokens:", {
+            "4nano": {
+              input: fourNanoTokens.input,
+              output: fourNanoTokens.output,
+              total: fourNanoTokens.input + fourNanoTokens.output,
+            },
+            "4mini": {
+              input: fourMiniTokens.input,
+              output: fourMiniTokens.output,
+              total: fourMiniTokens.input + fourMiniTokens.output,
+            },
+          });
           const cost = calculateCost(fourNanoTokens, fourMiniTokens);
           log("Cost:", {
             "4nano": `$${cost.fourNanoCost.toFixed(6)}`,
