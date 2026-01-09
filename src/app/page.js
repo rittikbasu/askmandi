@@ -56,12 +56,30 @@ const writeClipboard = async (text) => {
 
 // localStorage quota tracking (avoids unnecessary API calls when limit reached)
 const QUOTA_KEY = "askmandi:remaining";
+const QUOTA_TIMESTAMP_KEY = "askmandi:timestamp";
+const QUOTA_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const getStoredQuota = () => {
   if (typeof window === "undefined") return null;
   try {
     const val = localStorage.getItem(QUOTA_KEY);
-    return val !== null ? parseInt(val, 10) : null;
+    if (val === null) return null;
+
+    const quota = parseInt(val, 10);
+
+    if (quota === 0) {
+      const timestamp = localStorage.getItem(QUOTA_TIMESTAMP_KEY);
+      if (
+        timestamp &&
+        Date.now() - parseInt(timestamp, 10) >= QUOTA_EXPIRY_MS
+      ) {
+        localStorage.removeItem(QUOTA_KEY);
+        localStorage.removeItem(QUOTA_TIMESTAMP_KEY);
+        return null;
+      }
+    }
+
+    return quota;
   } catch {
     return null;
   }
@@ -71,6 +89,9 @@ const setStoredQuota = (remaining) => {
   if (typeof window === "undefined") return;
   try {
     localStorage.setItem(QUOTA_KEY, String(remaining));
+    if (remaining === 0) {
+      localStorage.setItem(QUOTA_TIMESTAMP_KEY, String(Date.now()));
+    }
   } catch {}
 };
 
@@ -91,7 +112,6 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    // Smooth scroll only when a full message is appended; streaming updates are throttled.
     if (!streamingContent) {
       scrollToBottom("smooth");
       return;
@@ -159,7 +179,7 @@ export default function Home() {
         {
           role: "assistant",
           content:
-            "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow.",
+            "You've reached the limit of 10 questions per 24 hours. Please try again tomorrow :)",
           usage: null,
         },
       ]);
