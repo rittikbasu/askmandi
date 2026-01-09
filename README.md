@@ -1,40 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/pages/api-reference/create-next-app).
+# askmandi
 
-## Getting Started
+a chat interface that lets you talk to mandi (indian agriculture market) data in plain language.
 
-First, run the development server:
+<img width="1416" height="987" alt="Screenshot 2026-01-09 at 8 10 19 PM" src="https://github.com/user-attachments/assets/1ab18ba8-453c-4b4d-a3d1-310e1d382d32" />
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+## why i built it
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+i recently found out that the government of india maintains open datasets across various sectors. most people can't access this data because it requires knowing sql or some other tool.
 
-You can start editing the page by modifying `pages/index.js`. The page auto-updates as you edit the file.
+so i thought it'd be a fun side project to build a chat interface that lets you talk to this data in plain language and get answers. i asked chatgpt to find me the best datasets and we settled on the agriculture market data.
 
-[API routes](https://nextjs.org/docs/pages/building-your-application/routing/api-routes) can be accessed on [http://localhost:3000/api/hello](http://localhost:3000/api/hello). This endpoint can be edited in `pages/api/hello.js`.
+the idea was to build something where an ai agent could autonomously understand what you're asking, decide what data to fetch, run the queries independently and then return answers all without hand holding. this was a good excuse for me to learn how to integrate mcp into a real project.
 
-The `pages/api` directory is mapped to `/api/*`. Files in this directory are treated as [API routes](https://nextjs.org/docs/pages/building-your-application/routing/api-routes) instead of React pages.
+## tech stack
 
-This project uses [`next/font`](https://nextjs.org/docs/pages/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- next.js
+- tailwindcss
+- supabase + mcp
+- upstash redis
 
-## Learn More
+## quickstart
 
-To learn more about Next.js, take a look at the following resources:
+1. clone the repo:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn-pages-router) - an interactive Next.js tutorial.
+   ```bash
+   git clone https://github.com/rittikbasu/askmandi.git
+   cd askmandi
+   ```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+2. install deps:
 
-## Deploy on Vercel
+   ```bash
+   npm install
+   ```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+3. create your `.env.local` with:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/pages/building-your-application/deploying) for more details.
+   ```bash
+   OPENAI_API_KEY=...
+
+   # supabase mcp
+   SUPABASE_PROJECT_REF=...
+   SUPABASE_PAT=...
+
+   # upstash kv (rate limit + cache)
+   KV_REST_API_URL=...
+   KV_REST_API_TOKEN=...
+   ```
+
+4. run:
+
+   ```bash
+   npm run dev
+   ```
+
+5. to setup up the db and fetch data run the companion [python script](https://github.com/rittikbasu/mandi_price_fetcher)
+
+## what it does
+
+- turns your question into **sql**
+- runs it against the database (via supabase mcp)
+- streams back a clean answer (and logs token + cost)
+
+## how i keep token usage low
+
+- **small selects**: i nudge the sql generator to only select columns needed for the answer
+- **two-model setup**: use a stronger model for sql generation (`gpt-4.1-mini`) and a cheaper one for summarizing the results (`gpt-4.1-nano`)
+- **location-first**: resolve state/district before generating sql so we don’t run “try again” queries
+- **toon encoding**: query results are sent to the summarizer as toon (about 50%-55% reduction in tokens)
+- **deterministic summaries**: summary model runs with `temperature: 0` to reduce weird reruns and inconsistent answers
+- **cache until refresh**: same question is cached until the next data refresh so repeat traffic is basically free
+- **rate limit**: 10 questions per visitor per 24h to stop prevent abuse
+- **cost logging**: every request prints token + $ cost in server logs so you can spot expensive prompts fast
+
+## contributing
+
+want to contribute? open a pr — bug fixes, smarter sql prompts, cheaper token usage or ui polish are all welcome.
