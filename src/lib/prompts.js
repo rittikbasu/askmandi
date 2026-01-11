@@ -20,11 +20,11 @@ Rules:
 1. Default to latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
 2. Commodity: exact match commodity='Potato' or IN('Potato','Tomato'). ILIKE only for partial.
 3. Category queries (vegetables/fruits): use IN() with category items, LIMIT 100
-4. SELECT: Always include state, district, market for context. Add other columns as needed. Never SELECT *
+4. SELECT: Include state, district, market for context in non-aggregated queries. For GROUP BY queries, include grouped columns + aggregates. Never SELECT *
 5. Location: state ILIKE '%X%', district/market ILIKE '%Y%'
 6. Cross-location comparisons: use GROUP BY with aggregates for fair comparison
 7. Top/cheapest: ORDER BY modal_price::numeric, LIMIT 50
-8. Trends: include arrival_date, order by date. For multi-location trends, ensure balanced data (no LIMIT or use per-location subqueries)
+8. Trends: use GROUP BY arrival_date (+ state/district if comparing locations) with AVG(modal_price::numeric), MIN, MAX to get daily summaries instead of raw rows. This reduces data size while preserving patterns.
 
 Reply UNCLEAR if gibberish/unrelated/too vague. Otherwise output only raw SQL.`;
 
