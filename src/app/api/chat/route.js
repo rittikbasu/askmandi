@@ -4,20 +4,29 @@ import { openai } from "@ai-sdk/openai";
 import { encode as toToon } from "@toon-format/toon";
 import { Redis } from "@upstash/redis";
 import { Ratelimit } from "@upstash/ratelimit";
+import {
+  buildSqlPrompt,
+  SUMMARY_PROMPT,
+  UNCLEAR_PROMPT,
+  LOCATION_EXTRACTOR_PROMPT,
+} from "@/lib/prompts";
 
-// Commodity names in db grouped by category - LLM uses this to map colloquial/Hindi names
-const COMMODITIES = `[Vegetables] Amaranthus,Ashgourd,Beans,Beetroot,Bhindi/Ladies Finger,Bitter Gourd,Bottle Gourd,Brinjal,Cabbage,Capsicum,Carrot,Cauliflower,Cluster Beans,Coriander(Leaves),Cucumber/Kheera,Drumstick,Garlic,Ginger(Green),Green Chilli,Green Peas,Lemon,Methi(Leaves),Mint/Pudina,Mushrooms,Onion,Pointed Gourd/Parval,Potato,Pumpkin,Raddish,Ridgeguard/Tori,Spinach,Sweet Potato,Tinda,Tomato,Turnip,Yam
-[Fruits] Amla,Apple,Banana,Ber,Chikoo/Sapota,Custard Apple,Grapes,Guava,Jack Fruit,Musk Melon,Kinnow,Mango,Mousambi/Sweet Lime,Orange,Papaya,Pear,Pineapple,Pomegranate,Water Melon
-[Grains] Arhar/Tur Dal,Bajra,Barley/Jau,Bengal Gram/Chana,Black Gram/Urad,Green Gram/Moong,Jowar,Kabuli Chana,Lentil/Masur,Maize,Paddy,Ragi,Rice,Wheat
-[Spices] Ajwan,Black Pepper,Chilli Red,Coriander Seed,Cumin/Jeera,Ginger(Dry),Methi Seeds,Mustard,Turmeric
-[Oilseeds] Castor Seed,Coconut,Groundnut,Sesamum/Til,Soyabean,Sunflower
-[Others] Arecanut/Supari,Cotton,Jaggery/Gur,Sugarcane,Tapioca`;
+// ─────────────────────────────────────────────────────────────────────────────
+// Configuration
+// ─────────────────────────────────────────────────────────────────────────────
 
-const log = (...args) => console.log("[api/chat]", ...args);
-const encoder = new TextEncoder();
+const MODELS = {
+  sql: "gpt-4.1-mini",           // Generates SQL from user query
+  summary: "gpt-4.1-nano",        // Summarizes data for user
+  unclear: "gpt-4.1-nano",        // Handles unclear queries
+  locationFallback: "gpt-4.1-nano", // Extracts locations for fallback
+};
 
 const MAX_INPUT_LENGTH = 200;
 const DATA_START_DATE = "2026-01-05";
+
+const log = (...args) => console.log("[api/chat]", ...args);
+const encoder = new TextEncoder();
 
 const UPSTASH_URL = process.env.KV_REST_API_URL;
 const UPSTASH_TOKEN = process.env.KV_REST_API_TOKEN;
@@ -111,47 +120,6 @@ function getTodayIST() {
     .slice(0, 10);
 }
 
-const buildSqlPrompt = () => {
-  const today = getTodayIST();
-
-  return `Convert mandi price questions to SQL.
-
-Table: mandi_prices (state, district, market, commodity, variety, grade, min_price, max_price, modal_price, arrival_date)
-Prices: ₹/quintal. Use modal_price::numeric for comparisons.
-Data available: ${DATA_START_DATE} to ${today} (~10,000 rows/day across all states)
-
-Commodities (use exact Title Case, map Hindi terms like aloo→Potato, tamatar→Tomato, pyaaz→Onion):
-${COMMODITIES}
-
-Rules:
-1. Default to latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
-2. Commodity: exact match commodity='Potato' or IN('Potato','Tomato'). ILIKE only for partial.
-3. Category queries (vegetables/fruits): use IN() with category items, LIMIT 100
-4. SELECT: Always include state, district, market for context. Add other columns as needed. Never SELECT *
-5. Location: state ILIKE '%X%', district/market ILIKE '%Y%'
-6. Cross-location comparisons: use GROUP BY with aggregates for fair comparison
-7. Top/cheapest: ORDER BY modal_price::numeric, LIMIT 50
-8. Trends: include arrival_date, order by date. For multi-location trends, ensure balanced data (no LIMIT or use per-location subqueries)
-
-Reply UNCLEAR if gibberish/unrelated/too vague. Otherwise output only raw SQL.`;
-};
-
-const SUMMARY_PROMPT = `You summarize mandi price data concisely. Prices are ₹/quintal; show as ₹/kg (divide by 100). Use markdown. Be direct.
-
-Critical rules:
-- Data provided below EXISTS. Never say "no data" or "not available" when data is provided.
-- Markets are within districts: if user asks about "Rajkot" and data shows district="Rajkot" with market="Gondal", that IS Rajkot data (Gondal is a market in Rajkot district).
-- Focus on answering the user's question with the provided data.
-- Be factual and concise.`;
-
-const UNCLEAR_PROMPT = `You are Ask Mandi, a mandi-price assistant. The user's request can't be answered.
-
-Write a short, friendly response that:
-- Clearly states you couldn't understand or the data isn't available.
-- Provides 2-3 specific example questions about mandi prices.
-
-Keep it under 3 short paragraphs.`;
-
 function sanitize(value) {
   return String(value || "")
     .trim()
@@ -225,32 +193,10 @@ function addUsage(a, b) {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Location extraction for fallback (single LLM call, only when needed)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const LOCATION_EXTRACTOR_PROMPT = `Extract Indian locations from the query. Return ONLY valid JSON (no markdown):
-{"locations": [{"name": "Place Name", "type": "state|district|city", "parentDistrict": "District or null", "parentState": "State or null"}]}
-
-Rules:
-- type: "state" for states, "district" for districts, "city" for cities/towns/villages/markets
-- parentDistrict: for cities, the district they belong to (null for states/districts)
-- parentState: the Indian state (null if type is "state")
-- Common mappings:
-  - Kalyan/Dombivli → Thane district, Maharashtra
-  - Andheri/Bandra/Kurla → Mumbai district, Maharashtra
-  - Gondal → Rajkot district, Gujarat
-  - Ooty → Nilgiris district, Tamil Nadu
-- Return empty array [] if no specific Indian location mentioned
-
-Examples:
-- "potato in Kalyan" → {"locations": [{"name": "Kalyan", "type": "city", "parentDistrict": "Thane", "parentState": "Maharashtra"}]}
-- "prices in Tamil Nadu and Kerala" → {"locations": [{"name": "Tamil Nadu", "type": "state", "parentDistrict": null, "parentState": null}, {"name": "Kerala", "type": "state", "parentDistrict": null, "parentState": null}]}
-- "tomato in Rajkot" → {"locations": [{"name": "Rajkot", "type": "district", "parentDistrict": null, "parentState": "Gujarat"}]}`;
-
 async function extractLocations(userMessage) {
   const result = await generateText({
-    model: openai("gpt-4.1-mini"),
+    model: openai(MODELS.locationFallback),
     system: LOCATION_EXTRACTOR_PROMPT,
     prompt: userMessage,
     maxTokens: 150,
@@ -376,9 +322,9 @@ export async function POST(req) {
 
     // Phase 1: Generate SQL directly (SQL model is smart enough to handle locations)
 
-    const sqlPrompt = buildSqlPrompt();
+    const sqlPrompt = buildSqlPrompt(DATA_START_DATE, getTodayIST());
     const sqlResult = await generateText({
-      model: openai("gpt-4.1-mini"),
+      model: openai(MODELS.sql),
       system: sqlPrompt,
       prompt: lastUserMessage,
       maxTokens: 250,
@@ -395,7 +341,7 @@ export async function POST(req) {
     // Handle unclear queries
     if (rawSql.toUpperCase() === "UNCLEAR" || !rawSql) {
       const clarification = await generateText({
-        model: openai("gpt-4.1-nano"),
+        model: openai(MODELS.unclear),
         system: UNCLEAR_PROMPT,
         prompt: `User message: ${lastUserMessage}`,
         maxTokens: 200,
@@ -544,7 +490,7 @@ LIMIT 50;`;
     );
 
     const summaryResult = streamText({
-      model: openai("gpt-4.1-nano"),
+      model: openai(MODELS.summary),
       system: SUMMARY_PROMPT,
       prompt: `Question: ${lastUserMessage}
 
