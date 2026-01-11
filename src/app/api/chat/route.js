@@ -5,16 +5,19 @@ import { encode as toToon } from "@toon-format/toon";
 import { Redis } from "@upstash/redis";
 import { Ratelimit } from "@upstash/ratelimit";
 
-// All commodity names in the db, helps LLM map colloquial names to official ones
-const COMMODITIES = `Vegetables: Amaranthus, Ashgourd, Beans, Beetroot, Bhindi(Ladies Finger), Bitter Gourd, Bottle Gourd, Brinjal, Bunch Beans, Cabbage, Capsicum, Carrot, Cauliflower, Chow Chow, Cluster Beans, Colacasia, Coriander(Leaves), Cowpea(Veg), Cucumbar(Kheera), Drumstick, Elephant Yam(Suran), French Beans(Frasbean), Garlic, Ginger(Green), Green Chilli, Green Peas, Knool Khol, Ladies Finger, Leafy Vegetable, Lemon, Lime, Little Gourd(Kundru), Long Melon(Kakri), Methi(Leaves), Mint(Pudina), Mushrooms, Onion, Onion Green, Peas Cod, Peas Wet, Pointed Gourd(Parval), Potato, Pumpkin, Raddish, Ridgeguard(Tori), Round Gourd, Season Leaves, Snake Gourd, Spinach, Sponge Gourd, Squash, Sweet Potato, Taro Leaves, Tinda, Tomato, Turnip, Yam(Ratalu)
-Fruits: Amla, Apple, Banana, Banana - Green, Ber, Chikoos(Sapota), Custard Apple, Grapes, Guava, Jack Fruit, Karbuja(Musk Melon), Kinnow, Kiwi, Mango, Mango(Raw-Ripe), Mousambi(Sweet Lime), Orange, Papaya, Papaya(Raw), Pear, Pineapple, Plum, Pomegranate, Tamarind Fruit, Water Melon
-Grains & Pulses: Arhar Dal, Arhar(Tur/Red Gram), Bajra(Pearl Millet), Barley(Jau), Bengal Gram Dal, Bengal Gram(Whole), Black Gram Dal, Black Gram(Urd), Foxtail Millet, Green Gram Dal, Green Gram(Moong), Jowar(Sorghum), Kabuli Chana, Kulthi(Horse Gram), Lentil(Masur), Maize, Paddy(Basmati), Paddy(Common), Ragi(Finger Millet), Red Gram, Rice, Wheat, White Peas
-Spices: Ajwan, Black Pepper, Chili Red, Dry Chillies, Coriander Seed, Cummin Seed(Jeera), Ginger(Dry), Methi Seeds, Mustard, Pepper Garbled, Poppy Seeds, Turmeric
-Oilseeds: Castor Seed, Coconut, Copra, Groundnut, Linseed, Safflower, Sesamum(Til), Soyabean, Sunflower
-Cash Crops: Arecanut(Supari), Betel Leaves, Coffee, Cotton, Gur(Jaggery), Jaggery, Jute, Rubber, Sugarcane, Tapioca`;
+// Commodity names in db grouped by category - LLM uses this to map colloquial/Hindi names
+const COMMODITIES = `[Vegetables] Amaranthus,Ashgourd,Beans,Beetroot,Bhindi/Ladies Finger,Bitter Gourd,Bottle Gourd,Brinjal,Cabbage,Capsicum,Carrot,Cauliflower,Cluster Beans,Coriander(Leaves),Cucumber/Kheera,Drumstick,Garlic,Ginger(Green),Green Chilli,Green Peas,Lemon,Methi(Leaves),Mint/Pudina,Mushrooms,Onion,Pointed Gourd/Parval,Potato,Pumpkin,Raddish,Ridgeguard/Tori,Spinach,Sweet Potato,Tinda,Tomato,Turnip,Yam
+[Fruits] Amla,Apple,Banana,Ber,Chikoo/Sapota,Custard Apple,Grapes,Guava,Jack Fruit,Musk Melon,Kinnow,Mango,Mousambi/Sweet Lime,Orange,Papaya,Pear,Pineapple,Pomegranate,Water Melon
+[Grains] Arhar/Tur Dal,Bajra,Barley/Jau,Bengal Gram/Chana,Black Gram/Urad,Green Gram/Moong,Jowar,Kabuli Chana,Lentil/Masur,Maize,Paddy,Ragi,Rice,Wheat
+[Spices] Ajwan,Black Pepper,Chilli Red,Coriander Seed,Cumin/Jeera,Ginger(Dry),Methi Seeds,Mustard,Turmeric
+[Oilseeds] Castor Seed,Coconut,Groundnut,Sesamum/Til,Soyabean,Sunflower
+[Others] Arecanut/Supari,Cotton,Jaggery/Gur,Sugarcane,Tapioca`;
 
 const log = (...args) => console.log("[api/chat]", ...args);
 const encoder = new TextEncoder();
+
+const MAX_INPUT_LENGTH = 200;
+const DATA_START_DATE = "2026-01-05";
 
 const UPSTASH_URL = process.env.KV_REST_API_URL;
 const UPSTASH_TOKEN = process.env.KV_REST_API_TOKEN;
@@ -102,95 +105,44 @@ function calculateCost(fourNanoTokens = {}, fourMiniTokens = {}) {
   };
 }
 
-const LOCATION_RESOLVER_PROMPT = `You map a user's mentioned place to state and district from provided lists.
+function getTodayIST() {
+  return new Date()
+    .toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
+    .slice(0, 10);
+}
 
-Return ONLY valid JSON (no markdown):
-{"state": string|null, "district": string|null, "confidence": number, "reason": string}
+const buildSqlPrompt = () => {
+  const today = getTodayIST();
 
-Rules:
-- state/district must be EXACTLY from the provided lists, or null if you can't decide.
-- confidence is 0 to 1. Be conservative: if ambiguous, return null with low confidence.
-- If the place IS a district in the list, set district to that exact value.
-- If the place is a city/town/village, find its parent district.
-- Common mappings: Kurla/Andheri/Bandra → Mumbai; Kalyan/Thane → Thane; Pune city → Pune.`;
+  return `Convert mandi price questions to SQL.
 
-const buildSqlPrompt = (locationContext) => {
-  let locationHint = "";
-  if (locationContext) {
-    const { requestedPlace, state, district, searchTerms } = locationContext;
-    locationHint = `\nLocation context for this query:
-- User asked about: "${requestedPlace}"
-- Resolved state: ${state || "unknown"}
-- Resolved district: ${district || "none (user mentioned state only)"}`;
+Table: mandi_prices (state, district, market, commodity, variety, grade, min_price, max_price, modal_price, arrival_date)
+Prices: ₹/quintal. Use modal_price::numeric for comparisons.
+Data available: ${DATA_START_DATE} to ${today} (~10,000 rows/day across all states)
 
-    if (district) {
-      // User mentioned a specific place/district - search both place and district
-      locationHint += `\n- Search terms for district/market: ${JSON.stringify(
-        searchTerms
-      )}
-- Filter: state ILIKE '%${state}%' AND (district ILIKE '%${
-        searchTerms[0]
-      }%' OR market ILIKE '%${searchTerms[0]}%'${
-        searchTerms[1]
-          ? ` OR district ILIKE '%${searchTerms[1]}%' OR market ILIKE '%${searchTerms[1]}%'`
-          : ""
-      })`;
-    } else if (state) {
-      // User only mentioned a state - just filter by state, no district/market filter needed
-      locationHint += `\n- Filter by state only: state ILIKE '%${state}%'
-- Do NOT add district/market filters - the user wants all data from this state.`;
-    }
-  }
-
-  return `You convert user questions about Indian mandi (agricultural market) prices into SQL queries.
-
-Table: mandi_prices
-Columns: state, district, market, commodity, variety, grade, min_price, max_price, modal_price, arrival_date
-Prices are in ₹/quintal (100 kg).
-
-Commodity names in database:
+Commodities (use exact Title Case, map Hindi terms like aloo→Potato, tamatar→Tomato, pyaaz→Onion):
 ${COMMODITIES}
-${locationHint}
 
 Rules:
-- Always filter by latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
-- Commodity matching - use EXACT Title Case names from the COMMODITIES list above:
-  - Map user's term to the exact name: "aloo" → 'Potato', "tamatar" → 'Tomato', "pyaaz" → 'Onion'
-  - Single commodity: commodity = 'Potato' (exact match, case-sensitive)
-  - Multiple commodities: commodity IN ('Potato', 'Tomato', 'Onion')
-  - For partial/fuzzy matches only: commodity ILIKE '%partial%'
-- For category queries like "vegetables" or "fruits":
-  - Use IN(...) with the exact Title Case names from COMMODITIES
-  - Example: commodity IN ('Potato', 'Tomato', 'Onion', 'Brinjal', 'Cabbage', ...)
-  - For broad categories, include common items and add LIMIT 100
-- Use modal_price for price comparisons (cast to numeric for math/order): modal_price::numeric
-- SELECT ONLY columns needed to answer the question (minimize tokens):
-  - Price queries: state, district, market, commodity, modal_price (skip variety/grade unless asked)
-  - Availability queries: DISTINCT state, commodity (or district, commodity)
-  - Comparison queries: state, commodity, modal_price (aggregated)
-  - Only include variety/grade/min_price/max_price if specifically relevant
-- For location filtering, use the provided search terms if available:
-  - Example: (district ILIKE '%term1%' OR market ILIKE '%term1%' OR district ILIKE '%term2%' OR market ILIKE '%term2%')
-  - Also filter by state if provided: AND state ILIKE '%Maharashtra%'
-  - If user mentions a state (like Gujarat), filter by state but DON'T also require district/market to match the state name.
-- For comparisons across states/districts, use aggregates (GROUP BY) instead of raw rows.
-- For "top/cheapest/highest" queries: SELECT DISTINCT, ORDER BY modal_price::numeric, LIMIT 10-200.
-- NEVER use SELECT *
-- If the user asks for "all data" or unbounded dumps, respond UNCLEAR
+1. Default to latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
+2. Commodity: exact match commodity='Potato' or IN('Potato','Tomato'). ILIKE only for partial.
+3. Category queries (vegetables/fruits): use IN() with category items, LIMIT 100
+4. SELECT: Always include state, district, market for context. Add other columns as needed. Never SELECT *
+5. Location: state ILIKE '%X%', district/market ILIKE '%Y%'
+6. Cross-location comparisons: use GROUP BY with aggregates for fair comparison
+7. Top/cheapest: ORDER BY modal_price::numeric, LIMIT 50
+8. Trends: include arrival_date, order by date. For multi-location trends, ensure balanced data (no LIMIT or use per-location subqueries)
 
-If the question is gibberish, unrelated, or too vague, respond with ONLY: UNCLEAR
-
-Otherwise, output ONLY the raw SQL query. No markdown, no code blocks, no explanation.`;
+Reply UNCLEAR if gibberish/unrelated/too vague. Otherwise output only raw SQL.`;
 };
 
 const SUMMARY_PROMPT = `You summarize mandi price data concisely. Prices are ₹/quintal; show as ₹/kg (divide by 100). Use markdown. Be direct.
 
 Critical rules:
-- If data is provided below, it EXISTS in our database. Never say "no data" or "not available" when data is provided.
-- If "Preface already sent" is provided, do NOT repeat it. Continue naturally after it.
+- Data provided below EXISTS. Never say "no data" or "not available" when data is provided.
+- Markets are within districts: if user asks about "Rajkot" and data shows district="Rajkot" with market="Gondal", that IS Rajkot data (Gondal is a market in Rajkot district).
 - Focus on answering the user's question with the provided data.
-- List specific items from the data (states, commodities, markets) to prove the data exists.
-- Be factual: if data shows 5 states, say "data for 5 states" not "I don't have data".`;
+- Be factual and concise.`;
 
 const UNCLEAR_PROMPT = `You are Ask Mandi, a mandi-price assistant. The user's request can't be answered.
 
@@ -207,30 +159,6 @@ function sanitize(value) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 60);
-}
-
-function extractLocationHint(text) {
-  const s = String(text || "").trim();
-  if (!s) return null;
-
-  // Skip location extraction for comparison/exclusion queries
-  // These need the full query context, not just location filtering
-  const comparisonPatterns = [
-    /\b(?:but\s+not|not\s+in|except|excluding|only\s+in|unique\s+to)\b/i,
-    /\bavailable\s+.*\bbut\b/i,
-    /\bcompare\b.*\b(?:with|to|and)\b/i,
-    /\bwhat\s+(?:states?|districts?|data)\s+do\s+you\s+have\b/i,
-  ];
-  if (comparisonPatterns.some((p) => p.test(s))) return null;
-
-  const m = s.match(/\b(?:in|near|around|at)\s+([a-z][a-z\s().,-]{2,60})/i);
-  if (!m) return null;
-  const raw = m[1].split(/[?.!,;:\n]/)[0].trim();
-  const cleaned = sanitize(raw);
-  if (!cleaned || cleaned.length < 3) return null;
-  if (["india", "today", "yesterday", "now"].includes(cleaned.toLowerCase()))
-    return null;
-  return cleaned;
 }
 
 function isSafeSelect(sql) {
@@ -297,136 +225,41 @@ function addUsage(a, b) {
   };
 }
 
-// Check if any row contains the place (word-boundary match)
-function rowContainsPlace(row, place) {
-  if (!row || !place) return false;
-  const tokens = sanitize(place)
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((t) => t.length >= 3);
-  if (!tokens.length) return false;
-
-  const fields = [row.district, row.market, row.state]
-    .filter(Boolean)
-    .map((v) => String(v).toLowerCase());
-
-  const match = (text, token) => {
-    const esc = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, "i").test(text);
-  };
-
-  return fields.some((f) => tokens.every((t) => match(f, t)));
-}
-
-// DB cache (states/districts)
-
-let statesCache = null;
-let statesCacheAt = 0;
-const districtsCache = new Map();
-const CACHE_TTL = 30 * 60 * 1000; // 30 min
-
-async function getStates(runQuery) {
-  if (statesCache && Date.now() - statesCacheAt < CACHE_TTL) return statesCache;
-  const rows = await runQuery(
-    "SELECT DISTINCT state FROM mandi_prices ORDER BY state;"
-  );
-  statesCache = rows.map((r) => r.state).filter(Boolean);
-  statesCacheAt = Date.now();
-  return statesCache;
-}
-
-async function getDistricts(runQuery, state) {
-  const key = String(state).toLowerCase();
-  const cached = districtsCache.get(key);
-  if (cached && Date.now() - cached.at < CACHE_TTL) return cached.districts;
-
-  const s = sanitize(state).replace(/'/g, "''");
-  const rows = await runQuery(
-    `SELECT DISTINCT district FROM mandi_prices WHERE state ILIKE '%${s}%' ORDER BY district;`
-  );
-  const districts = rows.map((r) => r.district).filter(Boolean);
-  districtsCache.set(key, { districts, at: Date.now() });
-  return districts;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Location resolution (BEFORE SQL generation)
+// Location extraction for fallback (single LLM call, only when needed)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function resolveLocation(runQuery, requestedPlace, userMessage) {
-  // Step 1: Get all states from DB
-  const states = await getStates(runQuery);
+const LOCATION_EXTRACTOR_PROMPT = `Extract Indian locations from the query. Return ONLY valid JSON (no markdown):
+{"locations": [{"name": "Place Name", "type": "state|district|city", "parentDistrict": "District or null", "parentState": "State or null"}]}
 
-  // Step 2: Check if user explicitly mentioned a state
-  const msgLower = userMessage.toLowerCase();
-  let state = states.find((s) => msgLower.includes(s.toLowerCase())) || null;
+Rules:
+- type: "state" for states, "district" for districts, "city" for cities/towns/villages/markets
+- parentDistrict: for cities, the district they belong to (null for states/districts)
+- parentState: the Indian state (null if type is "state")
+- Common mappings:
+  - Kalyan/Dombivli → Thane district, Maharashtra
+  - Andheri/Bandra/Kurla → Mumbai district, Maharashtra
+  - Gondal → Rajkot district, Gujarat
+  - Ooty → Nilgiris district, Tamil Nadu
+- Return empty array [] if no specific Indian location mentioned
 
-  // Step 3: If no explicit state, use LLM to infer from place name
-  let usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-  let district = null;
+Examples:
+- "potato in Kalyan" → {"locations": [{"name": "Kalyan", "type": "city", "parentDistrict": "Thane", "parentState": "Maharashtra"}]}
+- "prices in Tamil Nadu and Kerala" → {"locations": [{"name": "Tamil Nadu", "type": "state", "parentDistrict": null, "parentState": null}, {"name": "Kerala", "type": "state", "parentDistrict": null, "parentState": null}]}
+- "tomato in Rajkot" → {"locations": [{"name": "Rajkot", "type": "district", "parentDistrict": null, "parentState": "Gujarat"}]}`;
 
-  if (!state) {
-    // Single LLM call: resolve both state and district together
-    // First get a reasonable subset of districts (top states by data volume or all)
-    // For simplicity, we'll do a two-step: state first, then district
-    const stateResult = await generateText({
-      model: openai("gpt-4.1-nano"),
-      system: `You identify which Indian state a place belongs to.
-Return ONLY valid JSON: {"state": string|null, "confidence": number}
-The state must be EXACTLY one of these: ${JSON.stringify(states)}
-Common: Kurla/Mumbai/Thane → Maharashtra; Kolkata → West Bengal; Chennai → Tamil Nadu; Bangalore → Karnataka.`,
-      prompt: `Place: ${requestedPlace}`,
-      maxTokens: 80,
-    });
-    usage = addUsage(usage, normalizeUsage(stateResult.usage));
+async function extractLocations(userMessage) {
+  const result = await generateText({
+    model: openai("gpt-4.1-mini"),
+    system: LOCATION_EXTRACTOR_PROMPT,
+    prompt: userMessage,
+    maxTokens: 150,
+  });
 
-    const parsed = extractJson(stateResult.text);
-    if (parsed?.state && Number(parsed.confidence) >= 0.5) {
-      state = parsed.state;
-    }
-  }
-
-  // Step 4: If we have a state, resolve district
-  if (state) {
-    const districts = await getDistricts(runQuery, state);
-
-    // Check if requestedPlace IS a district (exact match)
-    district =
-      districts.find((d) => d.toLowerCase() === requestedPlace.toLowerCase()) ||
-      null;
-
-    // If not exact, use LLM to find parent district
-    if (!district && districts.length > 0) {
-      const distResult = await generateText({
-        model: openai("gpt-4.1-nano"),
-        system: LOCATION_RESOLVER_PROMPT,
-        prompt: `State: ${state}
-Place: ${requestedPlace}
-Districts in ${state}: ${JSON.stringify(districts)}`,
-        maxTokens: 100,
-      });
-      usage = addUsage(usage, normalizeUsage(distResult.usage));
-
-      const parsed = extractJson(distResult.text);
-      if (parsed?.district && Number(parsed.confidence) >= 0.5) {
-        district = parsed.district;
-      }
-    }
-  }
-
-  // Build search terms: always include user's place + resolved district if different
-  const searchTerms = [requestedPlace];
-  if (district && district.toLowerCase() !== requestedPlace.toLowerCase()) {
-    searchTerms.push(district);
-  }
-
+  const parsed = extractJson(result.text);
   return {
-    requestedPlace,
-    state,
-    district,
-    searchTerms,
-    isExact: district?.toLowerCase() === requestedPlace.toLowerCase(),
-    usage,
+    locations: parsed?.locations || [],
+    usage: normalizeUsage(result.usage),
   };
 }
 
@@ -447,6 +280,16 @@ export async function POST(req) {
   const lastUserMessage =
     [...messages].reverse().find((m) => m?.role === "user")?.content || "";
   log("Incoming request", { lastUser: lastUserMessage });
+
+  // Validate input length
+  if (lastUserMessage.length > MAX_INPUT_LENGTH) {
+    return Response.json(
+      {
+        error: `Message too long. Maximum ${MAX_INPUT_LENGTH} characters allowed.`,
+      },
+      { status: 400 }
+    );
+  }
 
   if (!redis || !ratelimit) {
     return Response.json(
@@ -498,7 +341,6 @@ export async function POST(req) {
   // Pass remaining quota in all responses so frontend can track
   const remaining = rl.remaining;
 
-  const requestedPlace = extractLocationHint(lastUserMessage);
   let mcpClient = null;
 
   try {
@@ -532,29 +374,9 @@ export async function POST(req) {
     let fourNanoTokens = { input: 0, output: 0 };
     let fourMiniTokens = { input: 0, output: 0 };
 
-    // Phase 1: Resolve location BEFORE generating SQL
+    // Phase 1: Generate SQL directly (SQL model is smart enough to handle locations)
 
-    let locationContext = null;
-    if (requestedPlace) {
-      locationContext = await resolveLocation(
-        runQuery,
-        requestedPlace,
-        lastUserMessage
-      );
-      totalUsage = addUsage(totalUsage, locationContext.usage);
-      fourNanoTokens.input += locationContext.usage.inputTokens || 0;
-      fourNanoTokens.output += locationContext.usage.outputTokens || 0;
-      log("Location resolved", {
-        place: requestedPlace,
-        state: locationContext.state,
-        district: locationContext.district,
-        terms: locationContext.searchTerms,
-      });
-    }
-
-    // Phase 2: Generate SQL with location context
-
-    const sqlPrompt = buildSqlPrompt(locationContext);
+    const sqlPrompt = buildSqlPrompt();
     const sqlResult = await generateText({
       model: openai("gpt-4.1-mini"),
       system: sqlPrompt,
@@ -620,34 +442,77 @@ export async function POST(req) {
       });
     }
 
-    // Phase 3: Execute SQL (single query, no reruns!)
+    // Phase 2: Execute SQL
 
     let data = await runQuery(sql);
     log("SQL returned", data.length, "rows");
 
-    // Check if we got an exact match for the requested place
-    let exactMatch = false;
-    if (requestedPlace && data.length > 0) {
-      exactMatch = data.some((row) => rowContainsPlace(row, requestedPlace));
-    }
-
-    // If no data and we have location context, try a broader fallback (state-level)
-    if (data.length === 0 && locationContext?.state) {
+    // Phase 3: Fallback if no data - try broader location (district → state)
+    let fallbackMessage = null;
+    if (data.length === 0) {
       // Extract commodity from the generated SQL
-      const commodityMatch = sql.match(/commodity\s+ilike\s+'%([^%']+)%'/i);
+      const commodityMatch =
+        sql.match(/commodity\s*=\s*'([^']+)'/i) ||
+        sql.match(/commodity\s+ilike\s+'%([^%']+)%'/i);
       const commodity = commodityMatch?.[1];
 
       if (commodity) {
-        const st = sanitize(locationContext.state).replace(/'/g, "''");
-        const fallbackSql = `SELECT DISTINCT state, district, market, variety, grade, min_price, max_price, modal_price
+        // Use location extractor to understand what places the user asked about
+        const locationResult = await extractLocations(lastUserMessage);
+        totalUsage = addUsage(totalUsage, locationResult.usage);
+        fourNanoTokens.input += locationResult.usage.inputTokens || 0;
+        fourNanoTokens.output += locationResult.usage.outputTokens || 0;
+        log("Locations extracted for fallback:", locationResult.locations);
+
+        // Find a city that has parentDistrict for fallback
+        const city = locationResult.locations.find(
+          (loc) => loc.type === "city" && loc.parentDistrict
+        );
+
+        // Step 1: If city with parentDistrict, try district first
+        if (city?.parentDistrict) {
+          const district = sanitize(city.parentDistrict).replace(/'/g, "''");
+          const districtSql = `SELECT state, district, market, commodity, modal_price
 FROM mandi_prices
 WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
-  AND commodity ILIKE '%${commodity}%'
-  AND state ILIKE '%${st}%'
+  AND commodity = '${commodity}'
+  AND district ILIKE '%${district}%'
 ORDER BY modal_price::numeric
 LIMIT 50;`;
-        data = await runQuery(fallbackSql);
-        log("Fallback to state-level returned", data.length, "rows");
+          data = await runQuery(districtSql);
+          log("Fallback to district-level returned", data.length, "rows");
+
+          if (data.length > 0) {
+            fallbackMessage = `No exact data for **${city.name}**. Showing data from **${city.parentDistrict}** district instead.`;
+          }
+        }
+
+        // Step 2: If still no data and we have parentState, try state
+        if (data.length === 0) {
+          const locWithState = locationResult.locations.find(
+            (loc) => loc.type !== "state" && loc.parentState
+          );
+
+          if (locWithState?.parentState) {
+            const state = sanitize(locWithState.parentState).replace(
+              /'/g,
+              "''"
+            );
+            const stateSql = `SELECT state, district, market, commodity, modal_price
+FROM mandi_prices
+WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
+  AND commodity = '${commodity}'
+  AND state ILIKE '%${state}%'
+ORDER BY modal_price::numeric
+LIMIT 50;`;
+            data = await runQuery(stateSql);
+            log("Fallback to state-level returned", data.length, "rows");
+
+            if (data.length > 0) {
+              fallbackMessage = `No exact data for **${locWithState.name}**. Showing data from **${locWithState.parentState}** instead.`;
+            }
+          }
+        }
       }
     }
 
@@ -660,9 +525,8 @@ LIMIT 50;`;
     // No data at all
     if (data.length === 0) {
       return Response.json({
-        message: requestedPlace
-          ? `No results found for **${requestedPlace}** on the latest date. Try a nearby district or the whole state.`
-          : "No results found. Try checking the commodity name or broadening your search.",
+        message:
+          "No results found. Try checking the commodity name or broadening your search.",
         usage: totalUsage,
         remaining,
       });
@@ -679,25 +543,12 @@ LIMIT 50;`;
       "chars"
     );
 
-    // Build honest prefix when we couldn't match exact place
-    // Skip if requestedPlace is essentially the same as resolved location (case-insensitive)
-    let forcedPrefix = "";
-    if (requestedPlace && !exactMatch) {
-      const showing =
-        locationContext?.district || locationContext?.state || "available data";
-      const isSameLocation =
-        showing.toLowerCase() === requestedPlace.toLowerCase();
-      if (!isSameLocation) {
-        forcedPrefix = `No data for **${requestedPlace}** on the latest date. Showing **${showing}** instead.\n\n`;
-      }
-    }
-
     const summaryResult = streamText({
       model: openai("gpt-4.1-nano"),
       system: SUMMARY_PROMPT,
       prompt: `Question: ${lastUserMessage}
 
-${forcedPrefix ? `Preface already sent: "${forcedPrefix.trim()}"` : ""}
+${fallbackMessage ? `Note: ${fallbackMessage}` : ""}
 
 Data:
 ${toonData}
@@ -713,13 +564,14 @@ Provide a helpful, concise answer.`,
         try {
           let fullText = "";
 
-          // Send forced prefix first
-          if (forcedPrefix) {
-            fullText += forcedPrefix;
+          // Send fallback message first if we had to broaden the search
+          if (fallbackMessage) {
+            const prefix = fallbackMessage + "\n\n";
+            fullText += prefix;
             controller.enqueue(
               encoder.encode(
                 `event: delta\ndata:${JSON.stringify({
-                  delta: forcedPrefix,
+                  delta: prefix,
                 })}\n\n`
               )
             );
