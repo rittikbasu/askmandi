@@ -39,10 +39,26 @@ const redis =
 const ratelimit = redis
   ? new Ratelimit({
       redis,
-      limiter: Ratelimit.slidingWindow(10, "24h"),
+      limiter: Ratelimit.fixedWindow(10, "12h"),
       prefix: "askmandi:rl",
     })
   : null;
+
+function formatDuration(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h`;
+  if (minutes > 0) return `${minutes}m`;
+  return "a moment";
+}
+
+// Track tokens based on actual model used
+function trackTokens(usage, modelName, tokenBuckets) {
+  const bucket = modelName.includes("nano") ? "nano" : "mini";
+  tokenBuckets[bucket].input += usage.inputTokens || 0;
+  tokenBuckets[bucket].output += usage.outputTokens || 0;
+}
 
 function normalizeCacheKey(input) {
   return String(input || "")
@@ -98,19 +114,19 @@ const PRICING = {
   "gpt-4.1-mini": { input: 0.4, output: 1.6 },
 };
 
-function calculateCost(fourNanoTokens = {}, fourMiniTokens = {}) {
-  const fourNanoCost =
-    ((fourNanoTokens.input || 0) * PRICING["gpt-4.1-nano"].input +
-      (fourNanoTokens.output || 0) * PRICING["gpt-4.1-nano"].output) /
+function calculateCost(nanoTokens = {}, miniTokens = {}) {
+  const nanoCost =
+    ((nanoTokens.input || 0) * PRICING["gpt-4.1-nano"].input +
+      (nanoTokens.output || 0) * PRICING["gpt-4.1-nano"].output) /
     1_000_000;
-  const fourMiniCost =
-    ((fourMiniTokens.input || 0) * PRICING["gpt-4.1-mini"].input +
-      (fourMiniTokens.output || 0) * PRICING["gpt-4.1-mini"].output) /
+  const miniCost =
+    ((miniTokens.input || 0) * PRICING["gpt-4.1-mini"].input +
+      (miniTokens.output || 0) * PRICING["gpt-4.1-mini"].output) /
     1_000_000;
   return {
-    fourNanoCost,
-    fourMiniCost,
-    totalCost: fourNanoCost + fourMiniCost,
+    nanoCost,
+    miniCost,
+    totalCost: nanoCost + miniCost,
   };
 }
 
@@ -133,7 +149,8 @@ function isSafeSelect(sql) {
   const s = String(sql || "")
     .trim()
     .toLowerCase();
-  if (!s || !s.startsWith("select")) return false;
+  // Allow SELECT or WITH (CTEs) as starting keywords
+  if (!s || (!s.startsWith("select") && !s.startsWith("with"))) return false;
   if (/[;](?!\s*$)/.test(s)) return false;
   if (
     /\b(insert|update|delete|drop|alter|create|truncate|grant|revoke)\b/.test(s)
@@ -273,10 +290,10 @@ export async function POST(req) {
     const retryAfterSeconds = rl.reset
       ? Math.max(1, Math.ceil((Number(rl.reset) - Date.now()) / 1000))
       : 3600;
+    const timer = formatDuration(retryAfterSeconds);
     return Response.json(
       {
-        error:
-          "You've reached the daily limit of 10 questions. Please try again tomorrow :)",
+        error: `You've reached the limit of 10 questions. Please try again in ${timer}.`,
         remaining: 0,
         reset: rl.reset,
       },
@@ -317,8 +334,10 @@ export async function POST(req) {
     };
 
     let totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    let fourNanoTokens = { input: 0, output: 0 };
-    let fourMiniTokens = { input: 0, output: 0 };
+    const tokenBuckets = {
+      nano: { input: 0, output: 0 },
+      mini: { input: 0, output: 0 },
+    };
 
     // Phase 1: Generate SQL directly (SQL model is smart enough to handle locations)
 
@@ -332,8 +351,7 @@ export async function POST(req) {
     });
     const sqlUsage = normalizeUsage(sqlResult.usage);
     totalUsage = addUsage(totalUsage, sqlUsage);
-    fourMiniTokens.input += sqlUsage.inputTokens || 0;
-    fourMiniTokens.output += sqlUsage.outputTokens || 0;
+    trackTokens(sqlUsage, MODELS.sql, tokenBuckets);
 
     const rawSql = (sqlResult.text || "").trim();
     log("SQL model response:", rawSql);
@@ -348,22 +366,21 @@ export async function POST(req) {
       });
       const clarUsage = normalizeUsage(clarification.usage);
       totalUsage = addUsage(totalUsage, clarUsage);
-      fourNanoTokens.input += clarUsage.inputTokens || 0;
-      fourNanoTokens.output += clarUsage.outputTokens || 0;
+      trackTokens(clarUsage, MODELS.unclear, tokenBuckets);
 
       log("Tokens (unclear):", {
-        "4nano": {
-          input: fourNanoTokens.input,
-          output: fourNanoTokens.output,
-          total: fourNanoTokens.input + fourNanoTokens.output,
+        nano: {
+          input: tokenBuckets.nano.input,
+          output: tokenBuckets.nano.output,
+          total: tokenBuckets.nano.input + tokenBuckets.nano.output,
         },
-        "4mini": {
-          input: fourMiniTokens.input,
-          output: fourMiniTokens.output,
-          total: fourMiniTokens.input + fourMiniTokens.output,
+        mini: {
+          input: tokenBuckets.mini.input,
+          output: tokenBuckets.mini.output,
+          total: tokenBuckets.mini.input + tokenBuckets.mini.output,
         },
       });
-      const cost = calculateCost(fourNanoTokens, fourMiniTokens);
+      const cost = calculateCost(tokenBuckets.nano, tokenBuckets.mini);
       log("Cost (unclear):", { total: `$${cost.totalCost.toFixed(6)}` });
 
       if (mcpClient?.close) await mcpClient.close();
@@ -406,8 +423,7 @@ export async function POST(req) {
         // Use location extractor to understand what places the user asked about
         const locationResult = await extractLocations(lastUserMessage);
         totalUsage = addUsage(totalUsage, locationResult.usage);
-        fourNanoTokens.input += locationResult.usage.inputTokens || 0;
-        fourNanoTokens.output += locationResult.usage.outputTokens || 0;
+        trackTokens(locationResult.usage, MODELS.locationFallback, tokenBuckets);
         log("Locations extracted for fallback:", locationResult.locations);
 
         // Find a city that has parentDistrict for fallback
@@ -536,27 +552,26 @@ Provide a helpful, concise answer.`,
           const summaryUsage = normalizeUsage(
             await summaryResult.usage.catch(() => ({}))
           );
-          fourNanoTokens.input += summaryUsage.inputTokens || 0;
-          fourNanoTokens.output += summaryUsage.outputTokens || 0;
+          trackTokens(summaryUsage, MODELS.summary, tokenBuckets);
           const finalUsage = addUsage(totalUsage, summaryUsage);
 
           // Log token usage and cost breakdown
           log("Tokens:", {
-            "4nano": {
-              input: fourNanoTokens.input,
-              output: fourNanoTokens.output,
-              total: fourNanoTokens.input + fourNanoTokens.output,
+            nano: {
+              input: tokenBuckets.nano.input,
+              output: tokenBuckets.nano.output,
+              total: tokenBuckets.nano.input + tokenBuckets.nano.output,
             },
-            "4mini": {
-              input: fourMiniTokens.input,
-              output: fourMiniTokens.output,
-              total: fourMiniTokens.input + fourMiniTokens.output,
+            mini: {
+              input: tokenBuckets.mini.input,
+              output: tokenBuckets.mini.output,
+              total: tokenBuckets.mini.input + tokenBuckets.mini.output,
             },
           });
-          const cost = calculateCost(fourNanoTokens, fourMiniTokens);
+          const cost = calculateCost(tokenBuckets.nano, tokenBuckets.mini);
           log("Cost:", {
-            "4nano": `$${cost.fourNanoCost.toFixed(6)}`,
-            "4mini": `$${cost.fourMiniCost.toFixed(6)}`,
+            nano: `$${cost.nanoCost.toFixed(6)}`,
+            mini: `$${cost.miniCost.toFixed(6)}`,
             total: `$${cost.totalCost.toFixed(6)}`,
           });
 

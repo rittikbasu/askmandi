@@ -44,8 +44,8 @@ function useRateLimit() {
     if (typeof window === "undefined") return;
     try {
       if (remaining === 0) {
-        // Fallback to 24h if no reset time provided
-        const effectiveReset = reset || Date.now() + 24 * 60 * 60 * 1000;
+        // Fallback to 12h if no reset time provided
+        const effectiveReset = reset || Date.now() + 12 * 60 * 60 * 1000;
         localStorage.setItem(
           QUOTA_KEY,
           JSON.stringify({ remaining, reset: effectiveReset })
@@ -99,38 +99,19 @@ const writeClipboard = async (text) => {
   }
 };
 
-const TimeRemaining = ({ resetTimestamp, onExpire }) => {
-  const [timeLeft, setTimeLeft] = useState("");
+function formatTimeRemaining(resetTimestamp) {
+  if (!resetTimestamp) return null;
+  const diff = resetTimestamp - Date.now();
+  if (diff <= 0) return null;
 
-  useEffect(() => {
-    const updateTimeLeft = () => {
-      const diff = resetTimestamp - Date.now();
+  const hours = Math.floor(diff / (1000 * 60 * 60));
+  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
 
-      if (diff <= 0) {
-        onExpire?.();
-        return;
-      }
-
-      const hours = Math.floor(diff / (1000 * 60 * 60));
-      const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-      const seconds = Math.floor((diff % (1000 * 60)) / 1000);
-
-      if (hours > 0) {
-        setTimeLeft(`${hours}h ${minutes}m`);
-      } else if (minutes > 0) {
-        setTimeLeft(`${minutes}m ${seconds}s`);
-      } else {
-        setTimeLeft(`${seconds}s`);
-      }
-    };
-
-    updateTimeLeft();
-    const interval = setInterval(updateTimeLeft, 1000);
-    return () => clearInterval(interval);
-  }, [resetTimestamp, onExpire]);
-
-  return timeLeft ? <span className="font-mono">{timeLeft}</span> : null;
-};
+  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h`;
+  if (minutes > 0) return `${minutes}m`;
+  return "a moment";
+}
 
 export default function Home() {
   const [messages, setMessages] = useState([WELCOME_MESSAGE]);
@@ -209,21 +190,25 @@ export default function Home() {
   const sendMessage = async (content) => {
     if (!content.trim() || isLoading) return;
 
-    // Check rate limit first
+    // Check rate limit from localStorage first
     if (isRateLimited) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", content: content.trim() },
-        {
-          role: "assistant",
-          content:
-            "You've reached the daily limit of 10 questions. Please try again tomorrow :)",
-          usage: null,
-          isRateLimited: true,
-        },
-      ]);
-      setInput("");
-      return;
+      const timer = formatTimeRemaining(resetTime);
+      if (!timer) {
+        // Timer expired, clear and proceed
+        clearQuota();
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          { role: "user", content: content.trim() },
+          {
+            role: "assistant",
+            content: `You've reached the limit of 10 questions. Please try again in ${timer}.`,
+            usage: null,
+          },
+        ]);
+        setInput("");
+        return;
+      }
     }
 
     const userMessage = { role: "user", content: content.trim() };
@@ -248,6 +233,7 @@ export default function Home() {
         .filter((m) => !m?.isIntro)
         .map(({ role, content }) => ({ role, content }));
 
+      const requestStartTime = performance.now();
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -275,9 +261,14 @@ export default function Home() {
         const decoder = new TextDecoder();
         let buffer = "";
         let streamError = null;
+        let ttft = null;
 
         const handleEvent = (eventType, payload) => {
           if (eventType === "delta" && payload?.delta) {
+            // Record time to first token
+            if (ttft === null) {
+              ttft = Math.round(performance.now() - requestStartTime);
+            }
             streamDraftRef.current += payload.delta;
             if (!streamFlushTimerRef.current) {
               streamFlushTimerRef.current = setTimeout(() => {
@@ -298,6 +289,7 @@ export default function Home() {
                 role: "assistant",
                 content: finalText,
                 usage,
+                ttft,
               },
             ]);
             streamDraftRef.current = "";
@@ -333,9 +325,8 @@ export default function Home() {
               ...prev,
               {
                 role: "assistant",
-                content: data.error || "Rate limit reached",
+                content: data.error || "Rate limit reached. Please try again later.",
                 usage: null,
-                isRateLimited: true,
               },
             ]);
             return;
@@ -418,8 +409,6 @@ export default function Home() {
                 message={message}
                 isWelcome={Boolean(message?.isIntro)}
                 onSuggestionClick={sendMessage}
-                rateLimitReset={message.isRateLimited ? resetTime : null}
-                onRateLimitExpire={clearQuota}
               />
             ))}
 
@@ -502,19 +491,14 @@ export default function Home() {
   );
 }
 
-function Message({
-  message,
-  isWelcome = false,
-  onSuggestionClick,
-  rateLimitReset = null,
-  onRateLimitExpire,
-}) {
+function Message({ message, isWelcome = false, onSuggestionClick }) {
   const isUser = message.role === "user";
   const [copied, setCopied] = useState(false);
   const tokenCount =
     typeof message?.usage?.totalTokens === "number"
       ? message.usage.totalTokens
       : null;
+  const ttft = typeof message?.ttft === "number" ? message.ttft : null;
 
   const handleCopy = useCallback(async () => {
     const plainText = toPlainText(message.content);
@@ -546,21 +530,6 @@ function Message({
             content={message.content}
             variant={isUser ? "user" : "assistant"}
           />
-
-          {/* Rate limit countdown */}
-          {(message.isRateLimited ||
-            message.content?.includes("reached the limit")) &&
-            rateLimitReset && (
-              <div className="mt-3 pt-3 border-t border-zinc-700/30">
-                <div className="text-xs text-zinc-400">
-                  Try again in:{" "}
-                  <TimeRemaining
-                    resetTimestamp={rateLimitReset}
-                    onExpire={onRateLimitExpire}
-                  />
-                </div>
-              </div>
-            )}
         </div>
 
         {/* Prompt suggestions for welcome message */}
@@ -646,9 +615,18 @@ function Message({
               {copied ? "Copied" : "Copy"}
             </button>
 
-            {typeof tokenCount === "number" && (
+            {tokenCount !== null && (
               <div className="rounded-full border border-zinc-700/50 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
                 {new Intl.NumberFormat().format(tokenCount)} tokens
+              </div>
+            )}
+
+            {ttft !== null && (
+              <div className="rounded-full border border-zinc-700/50 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
+                {ttft >= 1000
+                  ? `${(ttft / 1000).toFixed(1)}s`
+                  : `${ttft}ms`}{" "}
+                TTFT
               </div>
             )}
           </div>
