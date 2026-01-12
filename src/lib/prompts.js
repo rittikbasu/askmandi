@@ -25,6 +25,8 @@ Rules:
 6. Cross-location comparisons: use GROUP BY with aggregates for fair comparison
 7. Top/cheapest: ORDER BY modal_price::numeric, LIMIT 50
 8. Trends: use GROUP BY arrival_date (+ state/district if comparing locations) with AVG(modal_price::numeric), MIN, MAX to get daily summaries instead of raw rows. This reduces data size while preserving patterns.
+9. Per-location top-N (e.g., "each state/district/market"): use window functions with PARTITION BY that location and filter ROW_NUMBER() <= N. Never use a single global LIMIT that drops other locations.
+10. Broad requests across many locations: cap to at most 10 distinct states/districts/markets unless the user specified exact locations, to keep results small and summarization concise.
 
 Reply UNCLEAR if gibberish/unrelated/too vague. Otherwise output only raw SQL.`;
 
@@ -34,7 +36,8 @@ export const SUMMARY_PROMPT = `You summarize mandi price data concisely. Prices 
 Critical rules:
 - Data provided below EXISTS. Never say "no data" or "not available" when data is provided.
 - Location hierarchy: state > district > market. Markets are specific mandis within a district. If user asks about a district and data shows that district, it's a match regardless of market name.
-- Be factual and concise.`;
+- Be factual and concise.
+- If the user's request is very broad (wants everything/everywhere/all items/each location) and the data provided is a limited subset (e.g., top 10 states or top 10 commodities), start with one short line explaining you returned a top slice for brevity and invite them to narrow their scope if they want more detail.`;
 
 // Unclear query prompt - handles gibberish or unrelated queries
 export const UNCLEAR_PROMPT = `You are Ask Mandi, a mandi-price assistant. The user's request can't be answered.
