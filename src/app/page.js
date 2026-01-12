@@ -325,7 +325,8 @@ export default function Home() {
               ...prev,
               {
                 role: "assistant",
-                content: data.error || "Rate limit reached. Please try again later.",
+                content:
+                  data.error || "Rate limit reached. Please try again later.",
                 usage: null,
               },
             ]);
@@ -615,18 +616,16 @@ function Message({ message, isWelcome = false, onSuggestionClick }) {
               {copied ? "Copied" : "Copy"}
             </button>
 
-            {tokenCount !== null && (
+            {ttft !== null && (
               <div className="rounded-full border border-zinc-700/50 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
-                {new Intl.NumberFormat().format(tokenCount)} tokens
+                {ttft >= 1000 ? `${(ttft / 1000).toFixed(1)}s` : `${ttft}ms`}{" "}
+                TTFT
               </div>
             )}
 
-            {ttft !== null && (
+            {tokenCount !== null && (
               <div className="rounded-full border border-zinc-700/50 bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400">
-                {ttft >= 1000
-                  ? `${(ttft / 1000).toFixed(1)}s`
-                  : `${ttft}ms`}{" "}
-                TTFT
+                {new Intl.NumberFormat().format(tokenCount)} tokens
               </div>
             )}
           </div>
