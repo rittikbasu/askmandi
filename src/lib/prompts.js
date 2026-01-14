@@ -7,7 +7,10 @@ export const COMMODITIES = `[Vegetables] Amaranthus,Ashgourd,Beans,Beetroot,Bhin
 [Others] Arecanut/Supari,Cotton,Jaggery/Gur,Sugarcane,Tapioca`;
 
 // SQL generation prompt - converts user questions to SQL queries
-export const buildSqlPrompt = (dataStartDate, today) => `Convert mandi price questions to SQL.
+export const buildSqlPrompt = (
+  dataStartDate,
+  today
+) => `Convert mandi price questions to SQL.
 
 Table: mandi_prices (state, district, market, commodity, variety, grade, min_price, max_price, modal_price, arrival_date)
 Prices: ₹/quintal. Use modal_price::numeric for comparisons.
@@ -20,10 +23,10 @@ Rules:
 1. Default to latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
 2. Commodity: exact match commodity='Potato' or IN('Potato','Tomato'). ILIKE only for partial.
 3. Category queries (vegetables/fruits): use IN() with category items, LIMIT 100
-4. SELECT: Include state, district, market for context in non-aggregated queries. For GROUP BY queries, include grouped columns + aggregates. Never SELECT *
-5. Location: state ILIKE '%X%', district/market ILIKE '%Y%'
-6. Cross-location comparisons: use GROUP BY with aggregates for fair comparison
-7. Top/cheapest: ORDER BY modal_price::numeric, LIMIT 50
+4. Smallest result set: return only the rows needed to answer. Widen only for comparisons or per-location slices.
+5. SELECT: Include state, district, market for context in non-aggregated queries. For GROUP BY queries, include grouped columns + aggregates. Never SELECT *
+6. Locations/comparisons: state ILIKE '%X%', district/market ILIKE '%Y%'. For cross-location comparisons, use GROUP BY with aggregates.
+7. Cheapest/lowest: ORDER BY modal_price::numeric ASC, LIMIT 1–3 (1 if singular, 3 max). Top N: respect user N; if unspecified, default N=5.
 8. Trends: use GROUP BY arrival_date (+ state/district if comparing locations) with AVG(modal_price::numeric), MIN, MAX to get daily summaries instead of raw rows. This reduces data size while preserving patterns.
 9. Per-location top-N (e.g., "each state/district/market"): use window functions with PARTITION BY that location and filter ROW_NUMBER() <= N. Never use a single global LIMIT that drops other locations.
 10. Broad requests across many locations: cap to at most 10 distinct states/districts/markets unless the user specified exact locations, to keep results small and summarization concise.
