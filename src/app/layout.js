@@ -20,7 +20,6 @@ export const metadata = {
   icons: {
     icon: "/favicon.png",
   },
-  themeColor: "#000000",
   openGraph: {
     title: "Ask Mandi",
     description:
@@ -52,6 +51,7 @@ export const viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
+  themeColor: "#000000",
 };
 
 export default function RootLayout({ children }) {
