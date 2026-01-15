@@ -1,4 +1,4 @@
-// Commodity names in db grouped by category - LLM uses this to map colloquial/Hindi names
+// Exhaustive commodity list - LLM maps any language (regional Indian, foreign) to exact DB values
 export const COMMODITIES = `[Vegetables] Amaranthus,Ashgourd,Beans,Beetroot,Bhindi/Ladies Finger,Bitter Gourd,Bottle Gourd,Brinjal,Cabbage,Capsicum,Carrot,Cauliflower,Cluster Beans,Coriander(Leaves),Cucumber/Kheera,Drumstick,Garlic,Ginger(Green),Green Chilli,Green Peas,Lemon,Methi(Leaves),Mint/Pudina,Mushrooms,Onion,Pointed Gourd/Parval,Potato,Pumpkin,Raddish,Ridgeguard/Tori,Spinach,Sweet Potato,Tinda,Tomato,Turnip,Yam
 [Fruits] Amla,Apple,Banana,Ber,Chikoo/Sapota,Custard Apple,Grapes,Guava,Jack Fruit,Musk Melon,Kinnow,Mango,Mousambi/Sweet Lime,Orange,Papaya,Pear,Pineapple,Pomegranate,Water Melon
 [Grains] Arhar/Tur Dal,Bajra,Barley/Jau,Bengal Gram/Chana,Black Gram/Urad,Green Gram/Moong,Jowar,Kabuli Chana,Lentil/Masur,Maize,Paddy,Ragi,Rice,Wheat
@@ -10,46 +10,56 @@ export const COMMODITIES = `[Vegetables] Amaranthus,Ashgourd,Beans,Beetroot,Bhin
 export const buildSqlPrompt = (
   dataStartDate,
   today
-) => `Convert mandi price questions to SQL.
+) => `Convert mandi price questions to SQL. Return ONLY raw SQL, or UNCLEAR if gibberish/unrelated.
 
 Table: mandi_prices (state, district, market, commodity, variety, grade, min_price, max_price, modal_price, arrival_date)
-Prices: ₹/quintal. Use modal_price::numeric for comparisons.
-Data available: ${dataStartDate} to ${today} (~10,000 rows/day across all states)
+Prices in ₹/quintal. Use modal_price::numeric for math/comparisons.
+Data: ${dataStartDate} to ${today}. New data arrives daily at 3:30pm IST.
 
-Commodities (use exact Title Case, map Hindi terms like aloo→Potato, tamatar→Tomato, pyaaz→Onion):
+Commodities (EXHAUSTIVE list - map ANY language to exact Title Case match):
 ${COMMODITIES}
 
-Rules:
-1. Default to latest date: WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
-2. Commodity: exact match commodity='Potato' or IN('Potato','Tomato'). ILIKE only for partial.
-3. Category queries (vegetables/fruits): use IN() with category items, LIMIT 100
-4. Smallest result set: return only the rows needed to answer. Widen only for comparisons or per-location slices.
-5. SELECT: Include state, district, market for context in non-aggregated queries. For GROUP BY queries, include grouped columns + aggregates. Never SELECT *
-6. Locations/comparisons: state ILIKE '%X%', district/market ILIKE '%Y%'. For cross-location comparisons, use GROUP BY with aggregates.
-7. Cheapest/lowest: ORDER BY modal_price::numeric ASC, LIMIT 1–3 (1 if singular, 3 max). Top N: respect user N; if unspecified, default N=5.
-8. Trends: use GROUP BY arrival_date (+ state/district if comparing locations) with AVG(modal_price::numeric), MIN, MAX to get daily summaries instead of raw rows. This reduces data size while preserving patterns.
-9. Per-location top-N (e.g., "each state/district/market"): use window functions with PARTITION BY that location and filter ROW_NUMBER() <= N. Never use a single global LIMIT that drops other locations.
-10. Broad requests across many locations: cap to at most 10 distinct states/districts/markets unless the user specified exact locations, to keep results small and summarization concise.
-
-Reply UNCLEAR if gibberish/unrelated/too vague. Otherwise output only raw SQL.`;
+Rules (in priority order):
+1. MINIMAL DATA: Return only rows needed. For "how many" use COUNT(*), not row fetches.
+2. NEVER UNCLEAR FOR BROAD MANDI QUESTIONS: If the request is about mandi prices but too broad, answer with aggregated/limited SQL (do not reply UNCLEAR).
+3. MULTI-DAY QUERIES: ~10k rows/day. Queries spanning multiple days without specific commodity+location filters MUST aggregate (GROUP BY arrival_date with AVG/COUNT) or LIMIT heavily. Never return raw rows for broad date ranges.
+4. DEFAULT DATE: WHERE arrival_date=(SELECT MAX(arrival_date) FROM mandi_prices) unless user specifies dates.
+5. COMMODITY: Exact match commodity='Potato' or IN(...). ILIKE '%X%' only for partial names.
+6. LOCATION: state ILIKE '%X%', district/market ILIKE '%Y%'.
+7. LIMITS: Singular→LIMIT 1. "Cheapest/top"→LIMIT 3. Lists→LIMIT 5 unless user specifies N. Always LIMIT <= 100.
+8. AGGREGATION: For trends/comparisons, GROUP BY with AVG/MIN/MAX beats raw rows.
+9. PER-LOCATION QUERIES: Use ROW_NUMBER() OVER(PARTITION BY location). When spanning ALL/many locations, limit to top 3 per location to keep total under 100.
+10. BROAD QUERIES: Cap at 10 distinct locations unless user specified exact list.
+11. SELECT: Never SELECT *. Include state,district,market for context. GROUP BY: grouped cols + aggregates only.
+12. VARIETY/GRADE: Include in WHERE only if user explicitly asks. For price range questions, SELECT min_price,max_price too.`;
 
 // Summary prompt - summarizes mandi price data for user
-export const SUMMARY_PROMPT = `You summarize mandi price data concisely. Prices are ₹/quintal; show as ₹/kg (divide by 100). Use markdown. Be direct.
+export const buildSummaryPrompt = (
+  dataDate,
+  todayIST
+) => `Summarize mandi price data. Prices: ₹/quintal → show as ₹/kg (÷100). Markdown. Be direct.
 
-Critical rules:
-- Data provided below EXISTS. Never say "no data" or "not available" when data is provided.
-- Location hierarchy: state > district > market. Markets are specific mandis within a district. If user asks about a district and data shows that district, it's a match regardless of market name.
-- Be factual and concise.
-- If the user's request is very broad (wants everything/everywhere/all items/each location) and the data provided is a limited subset (e.g., top 10 states or top 10 commodities), start with one short line explaining you returned a top slice for brevity and invite them to narrow their scope if they want more detail.`;
+Data date: ${dataDate}. Today: ${todayIST}. Data refreshes daily at 3:30pm IST.
+
+Rules:
+- ONLY report the data. No speculation on causes, economics, or advice.
+- Data provided EXISTS. Never claim "no data" when data is shown.
+- If data date is before today, note it briefly (e.g., "Latest data is from ${dataDate}, refreshes at 3:30pm IST").
+- If current data is asked for and the current date is not the data date, note it briefly (e.g., "Latest data is from ${dataDate}, refreshes at 3:30pm IST").
+- Location: state > district > market. District match is valid regardless of specific market.
+- If results were truncated (noted below), briefly mention more results exist.`;
 
 // Unclear query prompt - handles gibberish or unrelated queries
-export const UNCLEAR_PROMPT = `You are Ask Mandi, a mandi-price assistant. The user's request can't be answered.
+export const UNCLEAR_PROMPT = `You are Ask Mandi. You ONLY answer questions about Indian mandi (agricultural market) prices. Nothing else.
 
-Write a short, friendly response that:
-- Clearly states you couldn't understand or the data isn't available.
-- Provides 2-3 specific example questions about mandi prices.
+The user's message is either unclear, unrelated, or too broad to answer directly.
 
-Keep it under 3 short paragraphs.`;
+Response rules:
+- Do NOT engage with off-topic content. No advice, opinions, or commentary on non-mandi topics.
+- If the query seems about mandi prices but too broad, say it's too broad and ask to narrow by commodity, location, or date range.
+- Otherwise, state you can only help with mandi price queries.
+- Give 2-3 example questions (e.g., "What's the price of tomatoes in Delhi?", "Cheapest onions today?").
+- Keep response under 3 sentences.`;
 
 // Location extractor prompt - used for fallback when initial query returns no results
 export const LOCATION_EXTRACTOR_PROMPT = `Extract Indian locations from the query. Return ONLY valid JSON (no markdown):

@@ -6,7 +6,7 @@ import { Redis } from "@upstash/redis";
 import { Ratelimit } from "@upstash/ratelimit";
 import {
   buildSqlPrompt,
-  SUMMARY_PROMPT,
+  buildSummaryPrompt,
   UNCLEAR_PROMPT,
   LOCATION_EXTRACTOR_PROMPT,
 } from "@/lib/prompts";
@@ -16,9 +16,9 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MODELS = {
-  sql: "gpt-4.1-mini",           // Generates SQL from user query
-  summary: "gpt-4.1-nano",        // Summarizes data for user
-  unclear: "gpt-4.1-nano",        // Handles unclear queries
+  sql: "gpt-4.1-mini", // Generates SQL from user query
+  summary: "gpt-4.1-nano", // Summarizes data for user
+  unclear: "gpt-4.1-nano", // Handles unclear queries
   locationFallback: "gpt-4.1-nano", // Extracts locations for fallback
 };
 
@@ -39,7 +39,7 @@ const redis =
 const ratelimit = redis
   ? new Ratelimit({
       redis,
-      limiter: Ratelimit.fixedWindow(10, "12h"),
+      limiter: Ratelimit.slidingWindow(10, "12h"),
       prefix: "askmandi:rl",
     })
   : null;
@@ -130,10 +130,37 @@ function calculateCost(nanoTokens = {}, miniTokens = {}) {
   };
 }
 
+// Get current date in IST (YYYY-MM-DD format for SQL)
 function getTodayIST() {
   return new Date()
     .toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
     .slice(0, 10);
+}
+
+// Get latest data date based on 3:30pm IST refresh schedule
+// Before 3:30pm → yesterday's data, After 3:30pm → today's data
+function getLatestDataDate() {
+  const now = new Date();
+  const istNow = new Date(
+    now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
+  );
+  const refreshHour = 15.5; // 3:30pm = 15.5
+  const currentHour = istNow.getHours() + istNow.getMinutes() / 60;
+
+  if (currentHour < refreshHour) {
+    // Before 3:30pm - use yesterday
+    istNow.setDate(istNow.getDate() - 1);
+  }
+  return istNow
+    .toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
+    .slice(0, 10);
+}
+
+// Format date as dd-mm-yyyy for user-facing output
+function formatDateDMY(dateStr) {
+  if (!dateStr) return null;
+  const [y, m, d] = dateStr.split("-");
+  return `${d}-${m}-${y}`;
 }
 
 function sanitize(value) {
@@ -208,6 +235,22 @@ function addUsage(a, b) {
     outputTokens: (a.outputTokens || 0) + (b.outputTokens || 0),
     totalTokens: (a.totalTokens || 0) + (b.totalTokens || 0),
   };
+}
+
+function logTokensAndCost(tokenBuckets, label = "") {
+  const suffix = label ? ` (${label})` : "";
+  log(`Tokens${suffix}:`, {
+    nano: {
+      ...tokenBuckets.nano,
+      total: tokenBuckets.nano.input + tokenBuckets.nano.output,
+    },
+    mini: {
+      ...tokenBuckets.mini,
+      total: tokenBuckets.mini.input + tokenBuckets.mini.output,
+    },
+  });
+  const cost = calculateCost(tokenBuckets.nano, tokenBuckets.mini);
+  log(`Cost${suffix}:`, { total: `$${cost.totalCost.toFixed(6)}` });
 }
 
 // Location extraction for fallback (single LLM call, only when needed)
@@ -368,20 +411,7 @@ export async function POST(req) {
       totalUsage = addUsage(totalUsage, clarUsage);
       trackTokens(clarUsage, MODELS.unclear, tokenBuckets);
 
-      log("Tokens (unclear):", {
-        nano: {
-          input: tokenBuckets.nano.input,
-          output: tokenBuckets.nano.output,
-          total: tokenBuckets.nano.input + tokenBuckets.nano.output,
-        },
-        mini: {
-          input: tokenBuckets.mini.input,
-          output: tokenBuckets.mini.output,
-          total: tokenBuckets.mini.input + tokenBuckets.mini.output,
-        },
-      });
-      const cost = calculateCost(tokenBuckets.nano, tokenBuckets.mini);
-      log("Cost (unclear):", { total: `$${cost.totalCost.toFixed(6)}` });
+      logTokensAndCost(tokenBuckets, "unclear");
 
       if (mcpClient?.close) await mcpClient.close();
       return Response.json({
@@ -423,7 +453,11 @@ export async function POST(req) {
         // Use location extractor to understand what places the user asked about
         const locationResult = await extractLocations(lastUserMessage);
         totalUsage = addUsage(totalUsage, locationResult.usage);
-        trackTokens(locationResult.usage, MODELS.locationFallback, tokenBuckets);
+        trackTokens(
+          locationResult.usage,
+          MODELS.locationFallback,
+          tokenBuckets
+        );
         log("Locations extracted for fallback:", locationResult.locations);
 
         // Find a city that has parentDistrict for fallback
@@ -496,6 +530,15 @@ LIMIT 50;`;
 
     // Phase 4: Stream summary
 
+    // Truncate to 100 rows max for summarizer (SQL is cheap, LLM tokens aren't)
+    const MAX_ROWS = 100;
+    const originalRowCount = data.length;
+    const wasTruncated = originalRowCount > MAX_ROWS;
+    if (wasTruncated) {
+      data = data.slice(0, MAX_ROWS);
+      log(`Truncated ${originalRowCount} rows to ${MAX_ROWS}`);
+    }
+
     const toonData = toToon(data);
     log(
       "TOON:",
@@ -505,17 +548,25 @@ LIMIT 50;`;
       "chars"
     );
 
+    // Calculate latest data date based on 3:30pm IST refresh schedule
+    const summaryPrompt = buildSummaryPrompt(
+      formatDateDMY(getLatestDataDate()),
+      formatDateDMY(getTodayIST())
+    );
+
+    const limitNote =
+      !wasTruncated && data.length === MAX_ROWS
+        ? `\nNote: Results were truncated for brevity. Showing ${MAX_ROWS} results. Ask a more specific question to see more.`
+        : "";
+
     const summaryResult = streamText({
       model: openai(MODELS.summary),
-      system: SUMMARY_PROMPT,
+      system: summaryPrompt,
       prompt: `Question: ${lastUserMessage}
-
-${fallbackMessage ? `Note: ${fallbackMessage}` : ""}
+${fallbackMessage ? `\nNote: ${fallbackMessage}` : ""}${limitNote}
 
 Data:
-${toonData}
-
-Provide a helpful, concise answer.`,
+${toonData}`,
       maxTokens: 300,
       temperature: 0, // Deterministic output
     });
@@ -555,25 +606,7 @@ Provide a helpful, concise answer.`,
           trackTokens(summaryUsage, MODELS.summary, tokenBuckets);
           const finalUsage = addUsage(totalUsage, summaryUsage);
 
-          // Log token usage and cost breakdown
-          log("Tokens:", {
-            nano: {
-              input: tokenBuckets.nano.input,
-              output: tokenBuckets.nano.output,
-              total: tokenBuckets.nano.input + tokenBuckets.nano.output,
-            },
-            mini: {
-              input: tokenBuckets.mini.input,
-              output: tokenBuckets.mini.output,
-              total: tokenBuckets.mini.input + tokenBuckets.mini.output,
-            },
-          });
-          const cost = calculateCost(tokenBuckets.nano, tokenBuckets.mini);
-          log("Cost:", {
-            nano: `$${cost.nanoCost.toFixed(6)}`,
-            mini: `$${cost.miniCost.toFixed(6)}`,
-            total: `$${cost.totalCost.toFixed(6)}`,
-          });
+          logTokensAndCost(tokenBuckets);
 
           // Cache response until next 3:30pm IST (data refresh time)
           if (cacheKey && redis) {
