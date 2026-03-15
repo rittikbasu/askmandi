@@ -207,12 +207,55 @@ function extractJson(text) {
   }
 }
 
+function tryParseJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function extractRowsFromText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+
+  const parsed = tryParseJson(raw);
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object" && parsed.result) {
+    return extractRowsFromText(parsed.result);
+  }
+
+  const tagged = raw.match(
+    /<untrusted-data-[^>]+>\s*([\s\S]*?)\s*<\/untrusted-data-[^>]+>/i
+  );
+  const candidate = tagged?.[1] || raw;
+  const arrayMatch = candidate.match(/\[[\s\S]*\]/);
+  if (!arrayMatch) return [];
+
+  const directArray = tryParseJson(arrayMatch[0]);
+  if (Array.isArray(directArray)) return directArray;
+
+  const unescapedArray = tryParseJson(arrayMatch[0].replace(/\\"/g, '"'));
+  return Array.isArray(unescapedArray) ? unescapedArray : [];
+}
+
 function parseDbResult(result) {
   try {
-    const rawText = result?.content?.[0]?.text || "";
-    const text = rawText.startsWith('"') ? JSON.parse(rawText) : rawText;
-    const match = text.match(/\[[\s\S]*?\]/);
-    return match ? JSON.parse(match[0]) : [];
+    if (Array.isArray(result?.toolResult)) return result.toolResult;
+
+    for (const item of result?.content || []) {
+      if (typeof item?.text === "string") {
+        const rows = extractRowsFromText(item.text);
+        if (rows.length) return rows;
+      }
+
+      if (typeof item?.resource?.text === "string") {
+        const rows = extractRowsFromText(item.resource.text);
+        if (rows.length) return rows;
+      }
+    }
+
+    return [];
   } catch (e) {
     log("Data extraction error:", e.message);
     return [];
