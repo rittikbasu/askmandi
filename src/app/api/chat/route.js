@@ -1,6 +1,6 @@
 import { experimental_createMCPClient as createMCPClient } from "@ai-sdk/mcp";
 import { generateText, streamText } from "ai";
-import { openai } from "@ai-sdk/openai";
+import { createGroq } from "@ai-sdk/groq";
 import { encode as toToon } from "@toon-format/toon";
 import { Redis } from "@upstash/redis";
 import { Ratelimit } from "@upstash/ratelimit";
@@ -10,20 +10,29 @@ import {
   UNCLEAR_PROMPT,
   LOCATION_EXTRACTOR_PROMPT,
 } from "@/lib/prompts";
+import { getModelConfig } from "@/lib/model-config.mjs";
+import { buildReadOnlyMcpUrl } from "@/lib/mcp-config.mjs";
+import { prepareDisplayRows } from "@/lib/display-rows.mjs";
+import { shouldBypassVisitorRateLimit } from "@/lib/runtime-config.mjs";
+import { extractSql, isSafeSelect } from "@/lib/sql-output.mjs";
+import {
+  getDailyProviderLimitMessage,
+  hasExhaustedDailyProviderCapacity,
+} from "@/lib/provider-error.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MODELS = {
-  sql: "gpt-4.1-mini", // Generates SQL from user query
-  summary: "gpt-4.1-nano", // Summarizes data for user
-  unclear: "gpt-4.1-nano", // Handles unclear queries
-  locationFallback: "gpt-4.1-nano", // Extracts locations for fallback
-};
+const { baseURL, apiKey, model: MODEL } = getModelConfig();
+const groq = createGroq({
+  baseURL,
+  apiKey,
+});
 
 const MAX_INPUT_LENGTH = 200;
 const DATA_START_DATE = "2026-01-05";
+const FALLBACK_MAX_ROWS = 5;
 
 const log = (...args) => console.log("[api/chat]", ...args);
 const encoder = new TextEncoder();
@@ -53,11 +62,11 @@ function formatDuration(seconds) {
   return "a moment";
 }
 
-// Track tokens based on actual model used
+// Track usage by exact model. Groq account limits and billing are provider-managed.
 function trackTokens(usage, modelName, tokenBuckets) {
-  const bucket = modelName.includes("nano") ? "nano" : "mini";
-  tokenBuckets[bucket].input += usage.inputTokens || 0;
-  tokenBuckets[bucket].output += usage.outputTokens || 0;
+  const bucket = tokenBuckets[modelName] || (tokenBuckets[modelName] = { input: 0, output: 0 });
+  bucket.input += usage.inputTokens || 0;
+  bucket.output += usage.outputTokens || 0;
 }
 
 function normalizeCacheKey(input) {
@@ -108,28 +117,6 @@ function getVisitorKey(req) {
   return `ip:${ip || "unknown"}|ua:${normalizedUA}`;
 }
 
-// Pricing per 1M tokens (in USD)
-const PRICING = {
-  "gpt-4.1-nano": { input: 0.1, output: 0.4 },
-  "gpt-4.1-mini": { input: 0.4, output: 1.6 },
-};
-
-function calculateCost(nanoTokens = {}, miniTokens = {}) {
-  const nanoCost =
-    ((nanoTokens.input || 0) * PRICING["gpt-4.1-nano"].input +
-      (nanoTokens.output || 0) * PRICING["gpt-4.1-nano"].output) /
-    1_000_000;
-  const miniCost =
-    ((miniTokens.input || 0) * PRICING["gpt-4.1-mini"].input +
-      (miniTokens.output || 0) * PRICING["gpt-4.1-mini"].output) /
-    1_000_000;
-  return {
-    nanoCost,
-    miniCost,
-    totalCost: nanoCost + miniCost,
-  };
-}
-
 // Get current date in IST (YYYY-MM-DD format for SQL)
 function getTodayIST() {
   return new Date()
@@ -137,31 +124,6 @@ function getTodayIST() {
     .slice(0, 10);
 }
 
-// Get latest data date based on 3:30pm IST refresh schedule
-// Before 3:30pm → yesterday's data, After 3:30pm → today's data
-function getLatestDataDate() {
-  const now = new Date();
-  const istNow = new Date(
-    now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
-  );
-  const refreshHour = 15.5; // 3:30pm = 15.5
-  const currentHour = istNow.getHours() + istNow.getMinutes() / 60;
-
-  if (currentHour < refreshHour) {
-    // Before 3:30pm - use yesterday
-    istNow.setDate(istNow.getDate() - 1);
-  }
-  return istNow
-    .toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" })
-    .slice(0, 10);
-}
-
-// Format date as dd-mm-yyyy for user-facing output
-function formatDateDMY(dateStr) {
-  if (!dateStr) return null;
-  const [y, m, d] = dateStr.split("-");
-  return `${d}-${m}-${y}`;
-}
 
 function sanitize(value) {
   return String(value || "")
@@ -170,28 +132,6 @@ function sanitize(value) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 60);
-}
-
-function isSafeSelect(sql) {
-  const s = String(sql || "")
-    .trim()
-    .toLowerCase();
-  // Allow SELECT or WITH (CTEs) as starting keywords
-  if (!s || (!s.startsWith("select") && !s.startsWith("with"))) return false;
-  if (/[;](?!\s*$)/.test(s)) return false;
-  if (
-    /\b(insert|update|delete|drop|alter|create|truncate|grant|revoke)\b/.test(s)
-  )
-    return false;
-  return true;
-}
-
-function extractSql(text) {
-  if (!text) return null;
-  let sql = text.trim();
-  const match = sql.match(/```(?:sql)?\s*([\s\S]*?)```/i);
-  if (match) sql = match[1].trim();
-  return sql || null;
 }
 
 function extractJson(text) {
@@ -282,27 +222,23 @@ function addUsage(a, b) {
 
 function logTokensAndCost(tokenBuckets, label = "") {
   const suffix = label ? ` (${label})` : "";
-  log(`Tokens${suffix}:`, {
-    nano: {
-      ...tokenBuckets.nano,
-      total: tokenBuckets.nano.input + tokenBuckets.nano.output,
-    },
-    mini: {
-      ...tokenBuckets.mini,
-      total: tokenBuckets.mini.input + tokenBuckets.mini.output,
-    },
-  });
-  const cost = calculateCost(tokenBuckets.nano, tokenBuckets.mini);
-  log(`Cost${suffix}:`, { total: `$${cost.totalCost.toFixed(6)}` });
+  const usage = Object.fromEntries(
+    Object.entries(tokenBuckets).map(([model, tokens]) => [
+      model,
+      { ...tokens, total: tokens.input + tokens.output },
+    ])
+  );
+  log(`Tokens${suffix}:`, usage);
 }
 
 // Location extraction for fallback (single LLM call, only when needed)
 async function extractLocations(userMessage) {
   const result = await generateText({
-    model: openai(MODELS.locationFallback),
+    model: groq(MODEL),
     system: LOCATION_EXTRACTOR_PROMPT,
     prompt: userMessage,
-    maxTokens: 150,
+    maxOutputTokens: 150,
+    providerOptions: { groq: { reasoningFormat: "hidden", reasoningEffort: "low" } },
   });
 
   const parsed = extractJson(result.text);
@@ -342,17 +278,14 @@ export async function POST(req) {
 
   if (!redis || !ratelimit) {
     return Response.json(
-      {
-        error: "Server misconfigured",
-        details: "Set UPSTASH_REST_URL and UPSTASH_REST_TOKEN.",
-      },
+      { error: "Service temporarily unavailable. Please try again later." },
       { status: 500 }
     );
   }
 
   // Check cache FIRST (cached responses are free - no rate limit consumed)
   const normalizedMessage = normalizeCacheKey(lastUserMessage);
-  const cacheKey = `askmandi:cache:v1:${normalizedMessage}`;
+  const cacheKey = `askmandi:cache:v19:${MODEL}:${normalizedMessage}`;
 
   try {
     const cached = await redis.get(cacheKey);
@@ -368,9 +301,13 @@ export async function POST(req) {
     log("Cache read failed", { message: e?.message });
   }
 
-  // Rate limit only for non-cached (LLM) requests
+  // The public visitor quota is intentionally disabled only for `next dev`.
+  // Preview and production both run with NODE_ENV=production, so they cannot bypass it.
+  const bypassVisitorRateLimit = shouldBypassVisitorRateLimit();
   const visitorKey = getVisitorKey(req);
-  const rl = await ratelimit.limit(visitorKey);
+  const rl = bypassVisitorRateLimit
+    ? { success: true, remaining: null }
+    : await ratelimit.limit(visitorKey);
 
   if (!rl.success) {
     const retryAfterSeconds = rl.reset
@@ -405,7 +342,7 @@ export async function POST(req) {
     mcpClient = await createMCPClient({
       transport: {
         type: "http",
-        url: `https://mcp.supabase.com/mcp?project_ref=${projectRef}`,
+        url: buildReadOnlyMcpUrl(projectRef),
         headers: { Authorization: `Bearer ${pat}` },
       },
     });
@@ -420,39 +357,37 @@ export async function POST(req) {
     };
 
     let totalUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    const tokenBuckets = {
-      nano: { input: 0, output: 0 },
-      mini: { input: 0, output: 0 },
-    };
+    const tokenBuckets = {};
 
-    // Phase 1: Generate SQL directly (SQL model is smart enough to handle locations)
-
+    // Phase 1: Convert the question into a bounded, read-only query.
     const sqlPrompt = buildSqlPrompt(DATA_START_DATE, getTodayIST());
     const sqlResult = await generateText({
-      model: openai(MODELS.sql),
+      model: groq(MODEL),
       system: sqlPrompt,
       prompt: lastUserMessage,
-      maxTokens: 250,
-      reasoningEffort: "low",
+      maxOutputTokens: 300,
+      providerOptions: {
+        groq: { reasoningFormat: "hidden", reasoningEffort: "low" },
+      },
     });
     const sqlUsage = normalizeUsage(sqlResult.usage);
     totalUsage = addUsage(totalUsage, sqlUsage);
-    trackTokens(sqlUsage, MODELS.sql, tokenBuckets);
-
+    trackTokens(sqlUsage, MODEL, tokenBuckets);
     const rawSql = (sqlResult.text || "").trim();
     log("SQL model response:", rawSql);
 
     // Handle unclear queries
     if (rawSql.toUpperCase() === "UNCLEAR" || !rawSql) {
       const clarification = await generateText({
-        model: openai(MODELS.unclear),
+        model: groq(MODEL),
         system: UNCLEAR_PROMPT,
         prompt: `User message: ${lastUserMessage}`,
-        maxTokens: 200,
+        maxOutputTokens: 120,
+        providerOptions: { groq: { reasoningFormat: "hidden", reasoningEffort: "low" } },
       });
       const clarUsage = normalizeUsage(clarification.usage);
       totalUsage = addUsage(totalUsage, clarUsage);
-      trackTokens(clarUsage, MODELS.unclear, tokenBuckets);
+      trackTokens(clarUsage, MODEL, tokenBuckets);
 
       logTokensAndCost(tokenBuckets, "unclear");
 
@@ -498,7 +433,7 @@ export async function POST(req) {
         totalUsage = addUsage(totalUsage, locationResult.usage);
         trackTokens(
           locationResult.usage,
-          MODELS.locationFallback,
+          MODEL,
           tokenBuckets
         );
         log("Locations extracted for fallback:", locationResult.locations);
@@ -517,7 +452,7 @@ WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
   AND commodity = '${commodity}'
   AND district ILIKE '%${district}%'
 ORDER BY modal_price::numeric
-LIMIT 50;`;
+LIMIT ${FALLBACK_MAX_ROWS};`;
           data = await runQuery(districtSql);
           log("Fallback to district-level returned", data.length, "rows");
 
@@ -543,7 +478,7 @@ WHERE arrival_date = (SELECT MAX(arrival_date) FROM mandi_prices)
   AND commodity = '${commodity}'
   AND state ILIKE '%${state}%'
 ORDER BY modal_price::numeric
-LIMIT 50;`;
+LIMIT ${FALLBACK_MAX_ROWS};`;
             data = await runQuery(stateSql);
             log("Fallback to state-level returned", data.length, "rows");
 
@@ -582,7 +517,8 @@ LIMIT 50;`;
       log(`Truncated ${originalRowCount} rows to ${MAX_ROWS}`);
     }
 
-    const toonData = toToon(data);
+    const displayRows = prepareDisplayRows(data);
+    const toonData = toToon(displayRows);
     log(
       "TOON:",
       toonData.length,
@@ -591,11 +527,7 @@ LIMIT 50;`;
       "chars"
     );
 
-    // Calculate latest data date based on 3:30pm IST refresh schedule
-    const summaryPrompt = buildSummaryPrompt(
-      formatDateDMY(getLatestDataDate()),
-      formatDateDMY(getTodayIST())
-    );
+    const summaryPrompt = buildSummaryPrompt();
 
     const limitNote =
       !wasTruncated && data.length === MAX_ROWS
@@ -603,15 +535,15 @@ LIMIT 50;`;
         : "";
 
     const summaryResult = streamText({
-      model: openai(MODELS.summary),
+      model: groq(MODEL),
       system: summaryPrompt,
       prompt: `Question: ${lastUserMessage}
 ${fallbackMessage ? `\nNote: ${fallbackMessage}` : ""}${limitNote}
 
 Data:
 ${toonData}`,
-      maxTokens: 300,
-      temperature: 0, // Deterministic output
+      maxOutputTokens: 1500,
+      providerOptions: { groq: { reasoningFormat: "hidden", reasoningEffort: "low" } },
     });
 
     // Stream response
@@ -646,7 +578,7 @@ ${toonData}`,
           const summaryUsage = normalizeUsage(
             await summaryResult.usage.catch(() => ({}))
           );
-          trackTokens(summaryUsage, MODELS.summary, tokenBuckets);
+          trackTokens(summaryUsage, MODEL, tokenBuckets);
           const finalUsage = addUsage(totalUsage, summaryUsage);
 
           logTokensAndCost(tokenBuckets);
@@ -677,10 +609,13 @@ ${toonData}`,
           );
           controller.close();
         } catch (err) {
+          const dailyProviderLimit = hasExhaustedDailyProviderCapacity(err);
           controller.enqueue(
             encoder.encode(
               `event: error\ndata:${JSON.stringify({
-                message: err?.message || "Stream error",
+                message: dailyProviderLimit
+                  ? getDailyProviderLimitMessage()
+                  : "Sorry, I couldn't finish that answer. Please try again.",
               })}\n\n`
             )
           );
@@ -703,8 +638,14 @@ ${toonData}`,
         await mcpClient.close();
       } catch {}
     }
+    if (hasExhaustedDailyProviderCapacity(error)) {
+      return Response.json(
+        { error: getDailyProviderLimitMessage() },
+        { status: 503 }
+      );
+    }
     return Response.json(
-      { error: "Failed to process your question", details: error.message },
+      { error: "Failed to process your question" },
       { status: 500 }
     );
   }

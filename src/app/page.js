@@ -332,6 +332,19 @@ export default function Home() {
             ]);
             return;
           }
+          if (response.status === 503) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content:
+                  data.error ||
+                  "Ask Mandi is temporarily busy. Please try again in a minute.",
+                usage: null,
+              },
+            ]);
+            return;
+          }
           throw new Error(data.error || "Failed to get response");
         }
         // Update quota (skip for cached responses)
@@ -550,11 +563,11 @@ function Message({ message, isWelcome = false, onSuggestionClick }) {
 
             <div className="mt-4 ml-1 inline-flex items-center text-sm text-zinc-400">
               <a
-                href="https://rittik.io"
+                href="https://rittik.fyi"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1 group hover:text-gray-200 transition-colors"
-                aria-label="Visit rittik.io"
+                aria-label="Visit rittik.fyi"
               >
                 made with
                 <svg
